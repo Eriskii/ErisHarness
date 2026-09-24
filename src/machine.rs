@@ -5,7 +5,7 @@
 pub use erissandbox::{DRAIN_GRACE, ExitStatus, Killer, OpenMode, Output, Process, SandboxSpec};
 
 use anyhow::{Result, bail};
-use erissandbox::{Sandbox, open_path, wait_exited};
+use erissandbox::{Host, OutsideCommand, Sandbox, open_path, wait_exited};
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -78,24 +78,40 @@ async fn reap_unless_killing(pidfd: &AsyncFd<OwnedFd>, reaped: &Mutex<bool>) -> 
     status
 }
 
-/// Runs commands on this machine as this user.
+/// Runs commands on this machine as this user. In a program that bootstrapped ErisSandbox,
+/// commands start outside its namespace through `host`, so they see the machine exactly as
+/// the user does.
 pub struct Direct {
     spec: DirectSpec,
     home: String,
+    host: Option<Host>,
 }
 
 impl Direct {
-    pub fn new(spec: DirectSpec) -> Self {
+    pub fn new(spec: DirectSpec, host: Option<Host>) -> Self {
         let from_spec = spec.env.as_ref().and_then(|env| env.iter().find(|(k, _)| k == "HOME").map(|(_, v)| v.clone()));
         let home = from_spec.or_else(|| std::env::var("HOME").ok()).unwrap_or_else(|| "/".into());
-        Self { spec, home }
+        Self { spec, home, host }
     }
 
-    fn start(&self, argv: &[String], cwd: &str) -> Result<Process> {
-        let Some((program, args)) = argv.split_first() else { bail!("empty command") };
+    async fn start(&self, argv: &[String], cwd: &str) -> Result<Process> {
+        if argv.is_empty() {
+            bail!("empty command");
+        }
         if !Path::new(cwd).is_dir() {
             bail!("Working directory does not exist: {cwd}");
         }
+        match &self.host {
+            Some(host) => {
+                let env = self.spec.env.clone().unwrap_or_else(|| std::env::vars().collect());
+                host.spawn_outside(OutsideCommand { argv: argv.to_vec(), cwd: cwd.into(), env, terminal: None }).await
+            }
+            None => self.start_here(argv, cwd),
+        }
+    }
+
+    fn start_here(&self, argv: &[String], cwd: &str) -> Result<Process> {
+        let Some((program, args)) = argv.split_first() else { bail!("empty command") };
         let (output, input) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
         let mut command = std::process::Command::new(program);
         command.args(args).current_dir(cwd).stdin(std::process::Stdio::null());
@@ -153,7 +169,7 @@ impl Machine for Direct {
     }
 
     fn spawn<'a>(&'a self, argv: &'a [String], cwd: Option<&'a str>) -> BoxFuture<'a, Result<Process>> {
-        Box::pin(async move { self.start(argv, cwd.unwrap_or(&self.spec.cwd)) })
+        Box::pin(self.start(argv, cwd.unwrap_or(&self.spec.cwd)))
     }
 
     fn open<'a>(&'a self, path: &'a str, mode: OpenMode) -> BoxFuture<'a, io::Result<OwnedFd>> {

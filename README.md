@@ -78,6 +78,11 @@ inbox (SQLite)  ──wake──▶  turn task  ──▶ provider ──▶ ite
 `env: None` inherits the harness's environment. Files open with the harness user's
 permissions. Children are reaped through pidfds, so running commands cost no threads.
 
+When the harness also has sandboxes, the program runs inside ErisSandbox's supervisor
+namespace, where the user appears as root. Direct commands then start through
+`Host::spawn_outside`, so they run as the user with the host's view of users and files, just
+as in a harness without sandboxes.
+
 ## Sandboxes
 
 Sandboxed agents run in [ErisSandbox](https://github.com/Eriskii/ErisSandbox) sandboxes. Enable

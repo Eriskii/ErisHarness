@@ -85,7 +85,7 @@ impl Agent {
                 let home = f.host_dir(&format!("direct-{name}"));
                 let home = home.to_str().unwrap().to_owned();
                 let env = vec![("HOME".to_owned(), home.clone()), ("PATH".to_owned(), std::env::var("PATH").unwrap())];
-                Arc::new(Direct::new(DirectSpec { cwd: home, env: Some(env) }))
+                Arc::new(Direct::new(DirectSpec { cwd: home, env: Some(env) }, Some(f.host.clone())))
             }
         };
         let context =

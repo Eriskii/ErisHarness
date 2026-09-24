@@ -101,6 +101,7 @@ impl HarnessBuilder {
         };
         let (observations, _) = broadcast::channel(4096);
         let harness = Arc::new_cyclic(|this| Harness {
+            host: self.host.clone(),
             mailbox: Arc::new(Inboxes(this.clone())),
             store,
             sandboxes,
@@ -128,6 +129,7 @@ struct Run {
 
 pub struct Harness {
     store: Store,
+    host: Option<Host>,
     sandboxes: Option<Sandboxes>,
     providers: HashMap<String, Arc<dyn Provider>>,
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -415,7 +417,7 @@ impl Harness {
             MachineSpec::Sandbox(sandbox) => {
                 self.sandboxes.as_ref().context("sandboxes are not enabled")?.sandbox(agent, sandbox.clone())?
             }
-            MachineSpec::Direct(direct) => Arc::new(Direct::new(direct.clone())),
+            MachineSpec::Direct(direct) => Arc::new(Direct::new(direct.clone(), self.host.clone())),
         };
         let mut announced = record.state == AgentState::Running;
         let mut context = record.context_tokens;

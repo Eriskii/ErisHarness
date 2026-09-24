@@ -32,6 +32,10 @@ fn main() {
         ("a_restarted_harness_resumes_unfinished_agents", a_restarted_harness_resumes_unfinished_agents),
         ("transcripts_are_jsonl_readable_by_other_agents", transcripts_are_jsonl_readable_by_other_agents),
         ("reasoning_is_carried_back_to_the_provider", reasoning_is_carried_back_to_the_provider),
+        (
+            "direct_agents_run_as_the_invoking_user_beside_sandboxes",
+            direct_agents_run_as_the_invoking_user_beside_sandboxes,
+        ),
     ]);
 }
 
@@ -355,4 +359,34 @@ fn send_message_respects_held_recipients(f: &Fixture) -> Result<(), Failed> {
     wait_for(&h, &recipient, AgentState::Idle)?;
     let input = recipient_model.requests()[0]["input"].clone();
     check(input.as_array().unwrap().len() == 2 && input[1]["content"][0]["text"] == "resume", format!("{input}"))
+}
+
+fn direct_agents_run_as_the_invoking_user_beside_sandboxes(f: &Fixture) -> Result<(), Failed> {
+    let model = Model::start(vec![calls("c1", "bash", json!({"command": "cat /proc/self/uid_map; pwd"})), says("ok")]);
+    let dir = f.host_dir("direct-beside");
+    let h = harness(f, &dir, &model);
+    let spec = AgentSpec {
+        machine: MachineSpec::Direct(erisharness::machine::DirectSpec { cwd: dir.to_str().unwrap().into(), env: None }),
+        ..spec(f)
+    };
+    let agent = h.create_agent(spec).unwrap();
+    h.send(&agent, "user", "who am I").unwrap();
+    wait_for(&h, &agent, AgentState::Idle)?;
+    let output = items(&h, &agent)
+        .into_iter()
+        .find_map(|i| match i {
+            Item::ToolResult { output, .. } => Some(output.content),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let text = match output.first() {
+        Some(tools::Content::Text(text)) => text.clone(),
+        _ => String::new(),
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    check(
+        lines.first().map(|l| l.split_whitespace().collect::<Vec<_>>()) == Some(vec!["0", "0", "4294967295"]),
+        format!("not the host's user namespace: {text:?}"),
+    )?;
+    check(lines.get(1) == Some(&dir.to_str().unwrap()), format!("{text:?}"))
 }

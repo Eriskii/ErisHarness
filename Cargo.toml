@@ -1,0 +1,39 @@
+[package]
+name = "erisharness"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+futures-util = "0.3.34"
+libc = "0.2.189"
+nix = { version = "0.31.3", features = ["mount", "sched", "socket", "uio", "signal", "process", "fs", "hostname", "user", "poll", "resource"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream", "http2"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+seccompiler = "0.5.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+similar = "3.2.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs"] }
+tokio-util = "0.7.19"
+unicode-normalization = "0.1.25"
+uuid = { version = "1.26.1", features = ["v7"] }
+
+[dev-dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+libtest-mimic = "0.8.2"
+tempfile = "3.27.0"
+
+[[test]]
+name = "sandbox"
+harness = false
+
+[[test]]
+name = "tools"
+harness = false
+
+[[test]]
+name = "agent"
+harness = false

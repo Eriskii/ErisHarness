@@ -2,7 +2,7 @@
 //! whole transcript is sent each time, and encrypted reasoning is carried back in it.
 
 use super::sse::Parser;
-use super::{Completion, Credentials, Progress, Provider, Request};
+use super::{Completion, Credentials, Progress, Provider, RateGate, Request};
 use crate::agent::{Item, Usage};
 use crate::tools::{Content, ToolOutput};
 use anyhow::{Result, anyhow, bail};
@@ -11,7 +11,7 @@ use futures_util::future::BoxFuture;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 pub struct ResponsesConfig {
     /// Endpoint root; requests go to `{base_url}/responses`.
@@ -23,6 +23,8 @@ pub struct ResponsesConfig {
     /// Attempts after the first for rate limits, server errors and dropped connections.
     pub max_retries: u32,
     pub credentials: Arc<dyn Credentials>,
+    /// Paces calls for the account; share one gate among every provider using the account.
+    pub gate: Arc<RateGate>,
 }
 
 pub struct Responses {
@@ -131,25 +133,31 @@ impl Provider for Responses {
         Box::pin(async move {
             let body = self.body(&request);
             let mut backoff = Duration::from_millis(250);
+            let report = |until| progress(Progress::RateLimited { until });
             for attempt in 0..=self.config.max_retries {
-                let (error, wait, limited) = match self.attempt(&body, progress).await {
-                    Ok(completion) => return Ok(completion),
+                let permit = self.config.gate.acquire(&report).await;
+                let (error, wait) = match self.attempt(&body, progress).await {
+                    Ok(completion) => {
+                        permit.succeeded();
+                        return Ok(completion);
+                    }
                     Err(Failure::Fatal(error)) => return Err(error),
-                    Err(Failure::Retry(error, wait)) => (error, wait, false),
-                    Err(Failure::RateLimited(error, wait)) => (error, wait, true),
+                    Err(Failure::RateLimited(error, wait)) => {
+                        // The gate holds this call, and every other, until the provider's time.
+                        permit.rate_limited(wait.unwrap_or(backoff));
+                        (error, None)
+                    }
+                    Err(Failure::Retry(error, wait)) => {
+                        drop(permit);
+                        (error, Some(wait.unwrap_or(backoff)))
+                    }
                 };
                 if attempt == self.config.max_retries {
                     return Err(error);
                 }
-                let wait = wait.unwrap_or(backoff);
                 backoff = (backoff * 2).min(Duration::from_secs(30));
-                if limited {
-                    let until = (SystemTime::now() + wait).duration_since(UNIX_EPOCH).unwrap_or_default();
-                    progress(Progress::RateLimited { until: Some(until.as_millis() as u64) });
-                }
-                tokio::time::sleep(wait).await;
-                if limited {
-                    progress(Progress::RateLimited { until: None });
+                if let Some(wait) = wait {
+                    tokio::time::sleep(wait).await;
                 }
             }
             bail!("no attempts made")

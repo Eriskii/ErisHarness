@@ -4,7 +4,7 @@ use super::{block_on, runtime};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use erisharness::provider::{Credentials, Responses, ResponsesConfig, StaticToken};
+use erisharness::provider::{Credentials, RateGate, Responses, ResponsesConfig, StaticToken};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -58,6 +58,7 @@ impl Model {
             store: false,
             max_retries: 3,
             credentials,
+            gate: RateGate::new(16, 256),
         }))
     }
 

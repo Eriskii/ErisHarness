@@ -1,9 +1,11 @@
 //! Model providers. A provider turns an agent's transcript into model output items. The
 //! harness knows nothing about wire formats; [`Responses`] speaks OpenAI's Responses API.
 
+mod gate;
 mod responses;
 mod sse;
 
+pub use gate::{Permit, RateGate};
 pub use responses::{Responses, ResponsesConfig};
 
 use crate::agent::{Item, Usage};

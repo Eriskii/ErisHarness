@@ -5,7 +5,7 @@ transcript on disk. A live agent costs under a megabyte; an idle one costs a dat
 
 Each agent runs on a machine chosen per agent:
 
-- **Sandbox**: a private copy-on-write filesystem, process tree, loopback network, hostname
+- **Sandbox**: an ErisSandbox sandbox, with a private copy-on-write filesystem, process tree, loopback network, hostname
   and cgroup. Inside it the agent is root and can install packages and run any program;
   nothing of the host is visible except kernel and hardware facts.
 - **Direct**: this machine, as this user, in a working directory, with the harness's
@@ -62,38 +62,16 @@ permissions. Children are reaped through pidfds, so running commands cost no thr
 
 ## Sandboxes
 
-Enable them with `HarnessBuilder::sandboxes(&host)`, where `host` comes from `bootstrap()`,
-which must be the first call in `main`. It moves the process into a delegated cgroup
-subtree and re-enters it inside a user namespace backed by the user's `/etc/subuid` range
-(`newuidmap`), so the harness needs no root. The same binary becomes a sandbox init when
-re-executed.
-
-A sandbox is live only while something runs in it. The first request `clone3`s an init
-directly into new user, mount, PID, network, IPC, UTS and cgroup namespaces and into its own
-cgroup. The init then:
-
-- mounts an overlay of the image (`rootfs`) with the agent's upper layer, plus `Layer`s
-  (copy-on-write project directories) and `Bind`s (live host directories, read-only if
-  asked, such as `.ae` records) — all before `pivot_root`, which detaches the host;
-- mounts fresh `/proc`, read-only `/sys`, a read-only cgroup view, and a minimal `/dev`;
-- drops to Docker's default capabilities, sets no-new-privs, becomes non-dumpable, and
-  installs a seccomp filter that denies namespace creation, mounting, BPF, io_uring,
-  keyrings, userfaultfd and module loading;
-- serves spawn, kill and open requests over a socket. File tools open paths *inside* the
-  sandbox and receive the descriptor, so symlinks cannot escape.
-
-Commands raise their own OOM score so the kernel kills them before the init. The sandbox
-hibernates after `idle_grace` with no processes left; its filesystem persists.
-
-What an agent can still see: kernel version, CPU and memory totals, and timing. It shares the
-host kernel, so a kernel exploit escapes, as with any container.
+Sandboxed agents run in [ErisSandbox](https://github.com/Eriskii/ErisSandbox) sandboxes. Enable
+them with `HarnessBuilder::sandboxes(&host)`, where `host` comes from `erissandbox::bootstrap()`,
+the first call in `main`. Each agent's sandbox has the agent's id. It is live only while the
+agent runs commands and hibernates after the harness's `idle_grace`. The harness implements
+`Machine` for `erissandbox::Sandbox`.
 
 ## Requirements
 
-Linux with cgroup v2 (memory, pids and cpu delegated to the user, as systemd's
-`user@.service` does), unprivileged user namespaces, a `/etc/subuid` and `/etc/subgid` range
-of at least 65536 ids, and `newuidmap`/`newgidmap`. Images are plain directories;
-`rootfs::import` unpacks a `docker export` tarball with ownership intact.
+Direct agents need only Linux and `bash`. Sandboxed agents need what
+[ErisSandbox](https://github.com/Eriskii/ErisSandbox#requirements) needs.
 
 ## Verification
 
@@ -102,3 +80,6 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test          # needs Docker once, to export debian:bookworm-slim as the test image
 ```
+
+The sandbox isolation tests live in ErisSandbox.
+

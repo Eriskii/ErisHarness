@@ -340,13 +340,13 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.23.1",
+ "erissandbox",
  "futures-util",
  "libc",
  "libtest-mimic",
  "nix",
  "reqwest",
  "rusqlite",
- "seccompiler",
  "serde",
  "serde_json",
  "similar",
@@ -355,6 +355,20 @@ dependencies = [
  "tokio-util",
  "unicode-normalization",
  "uuid",
+]
+
+[[package]]
+name = "erissandbox"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "libc",
+ "nix",
+ "seccompiler",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

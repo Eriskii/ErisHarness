@@ -2,8 +2,7 @@
 
 pub mod model;
 
-use erisharness::Host;
-use erisharness::sandbox::{Limits, Output, Sandbox, SandboxSpec, Sandboxes};
+use erissandbox::{Host, Limits, Output, Sandbox, SandboxSpec, Sandboxes};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
@@ -13,7 +12,7 @@ pub type Test = fn(&Fixture) -> Result<(), libtest_mimic::Failed>;
 /// Bootstraps into the harness namespace, then runs each test against one shared fixture.
 /// Test binaries use this as `main` because bootstrap must precede every thread.
 pub fn run(tests: &[(&'static str, Test)]) -> ! {
-    let host = erisharness::bootstrap().expect("bootstrap");
+    let host = erissandbox::bootstrap().expect("bootstrap");
     let fixture = Arc::new(Fixture::new(host));
     let trials = tests
         .iter()
@@ -94,7 +93,7 @@ fn test_rootfs() -> PathBuf {
     let mut export = Command::new("docker").args(["export", &id]).stdout(Stdio::piped()).spawn().unwrap();
     let staging = dir.with_extension("partial");
     let _ = std::fs::remove_dir_all(&staging);
-    erisharness::rootfs::import(export.stdout.take().unwrap(), &staging).expect("import rootfs");
+    erissandbox::rootfs::import(export.stdout.take().unwrap(), &staging).expect("import rootfs");
     assert!(export.wait().unwrap().success());
     let _ = Command::new("docker").args(["rm", &id]).output();
     std::fs::rename(&staging, &dir).unwrap();

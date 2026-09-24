@@ -248,7 +248,7 @@ fn transcripts_are_jsonl_readable_by_other_agents(f: &Fixture) -> Result<(), Fai
     check(lines.len() == 2 && lines[0]["seq"] == 0 && lines[1]["type"] == "assistant", format!("{lines:?}"))?;
     let mut reader_spec = spec(f);
     let MachineSpec::Sandbox(sandbox) = &mut reader_spec.machine else { unreachable!() };
-    sandbox.binds.push(erisharness::sandbox::Bind {
+    sandbox.binds.push(erissandbox::Bind {
         source: path.parent().unwrap().parent().unwrap().to_path_buf(),
         target: "/records".into(),
         writable: false,

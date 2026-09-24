@@ -2,14 +2,13 @@
 //! in memory. Mail wakes an agent: a task loads its transcript, runs model calls and tools
 //! until there is nothing left to answer, then drops everything and exits.
 
-use crate::Host;
 use crate::agent::{AgentRecord, AgentSpec, AgentState, Entry, Item, Observation};
 use crate::machine::{Direct, Machine, MachineSpec};
 use crate::provider::{Provider, Request, ToolSpec};
-use crate::sandbox::Sandboxes;
 use crate::store::{Store, Transcript};
 use crate::tools::{Mailbox, Tool, ToolContext, ToolOutput};
 use anyhow::{Context, Result, bail};
+use erissandbox::{Host, Sandboxes};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -28,7 +27,7 @@ pub struct HarnessBuilder {
 }
 
 impl HarnessBuilder {
-    /// Enables sandboxed agents. Requires [`bootstrap`](crate::bootstrap) at the start of
+    /// Enables sandboxed agents. Requires [`erissandbox::bootstrap`] at the start of
     /// `main`. Without it the harness runs only direct agents and needs no setup at all.
     pub fn sandboxes(mut self, host: &Host) -> Self {
         self.host = Some(host.clone());

@@ -11,8 +11,8 @@
 use erisharness::agent::{AgentSpec, AgentState, Item, Usage};
 use erisharness::machine::MachineSpec;
 use erisharness::provider::{Completion, Provider, Request};
-use erisharness::sandbox::{Limits, SandboxSpec, Sandboxes};
 use erisharness::{Harness, tools};
+use erissandbox::{Limits, SandboxSpec, Sandboxes};
 use futures_util::future::BoxFuture;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -79,7 +79,7 @@ fn sandbox_memory() -> (u64, u64, usize) {
 }
 
 fn main() -> anyhow::Result<()> {
-    let host = erisharness::bootstrap()?;
+    let host = erissandbox::bootstrap()?;
     let args: Vec<String> = std::env::args().collect();
     let rootfs = PathBuf::from(args.get(1).expect("usage: scale <rootfs> [idle] [live] [turns]"));
     let count = |i: usize, default: usize| args.get(i).and_then(|a| a.parse().ok()).unwrap_or(default);

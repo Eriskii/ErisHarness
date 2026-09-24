@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Every tool test runs on both machines: model-facing behavior must not depend on isolation.
 fn main() {
-    let host = erisharness::bootstrap().expect("bootstrap");
+    let host = erissandbox::bootstrap().expect("bootstrap");
     let fixture = Arc::new(Fixture::new(host));
     let tests: &[(&str, Test)] = &[
         ("read_returns_the_file", read_returns_the_file),

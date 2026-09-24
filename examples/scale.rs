@@ -10,7 +10,7 @@
 
 use erisharness::agent::{AgentSpec, AgentState, Item, Usage};
 use erisharness::machine::MachineSpec;
-use erisharness::provider::{Completion, Provider, Request};
+use erisharness::provider::{Completion, Progress, Provider, Request};
 use erisharness::{Harness, tools};
 use erissandbox::{Limits, SandboxSpec, Sandboxes};
 use futures_util::future::BoxFuture;
@@ -25,7 +25,7 @@ impl Provider for Stub {
     fn complete<'a>(
         &'a self,
         request: Request<'a>,
-        _: &'a (dyn Fn(&str) + Send + Sync),
+        _: &'a (dyn Fn(Progress) + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<Completion>> {
         Box::pin(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;

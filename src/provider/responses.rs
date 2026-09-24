@@ -2,7 +2,7 @@
 //! whole transcript is sent each time, and encrypted reasoning is carried back in it.
 
 use super::sse::Parser;
-use super::{Completion, Credentials, Provider, Request};
+use super::{Completion, Credentials, Progress, Provider, Request};
 use crate::agent::{Item, Usage};
 use crate::tools::{Content, ToolOutput};
 use anyhow::{Result, anyhow, bail};
@@ -11,7 +11,7 @@ use futures_util::future::BoxFuture;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct ResponsesConfig {
     /// Endpoint root; requests go to `{base_url}/responses`.
@@ -59,7 +59,7 @@ impl Responses {
         body
     }
 
-    async fn attempt(&self, body: &Value, on_text: &(dyn Fn(&str) + Send + Sync)) -> Result<Completion, Failure> {
+    async fn attempt(&self, body: &Value, progress: &(dyn Fn(Progress) + Send + Sync)) -> Result<Completion, Failure> {
         let authorization = self.config.credentials.authorize().await.map_err(Failure::Fatal)?;
         let mut builder = self
             .client
@@ -79,8 +79,13 @@ impl Responses {
                 .and_then(|v| v["error"]["message"].as_str().map(str::to_owned))
                 .unwrap_or(text);
             let error = anyhow!("{} {message}", status.as_u16());
-            let transient = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
-            return Err(if transient { Failure::Retry(error, wait) } else { Failure::Fatal(error) });
+            return Err(if status == StatusCode::TOO_MANY_REQUESTS {
+                Failure::RateLimited(error, wait)
+            } else if status.is_server_error() {
+                Failure::Retry(error, wait)
+            } else {
+                Failure::Fatal(error)
+            });
         }
         let mut stream = response.bytes_stream();
         let mut parser = Parser::default();
@@ -90,7 +95,9 @@ impl Responses {
             for data in parser.feed(&chunk) {
                 let Ok(event) = serde_json::from_str::<Value>(&data) else { continue };
                 match event["type"].as_str().unwrap_or_default() {
-                    "response.output_text.delta" => on_text(event["delta"].as_str().unwrap_or_default()),
+                    "response.output_text.delta" => {
+                        progress(Progress::Text(event["delta"].as_str().unwrap_or_default()))
+                    }
                     "response.output_item.done" => items.extend(output_item(&event["item"])),
                     "response.completed" | "response.incomplete" => {
                         return Ok(Completion { items, usage: usage(&event["response"]["usage"]) });
@@ -111,6 +118,7 @@ impl Responses {
 
 enum Failure {
     Retry(anyhow::Error, Option<Duration>),
+    RateLimited(anyhow::Error, Option<Duration>),
     Fatal(anyhow::Error),
 }
 
@@ -118,22 +126,30 @@ impl Provider for Responses {
     fn complete<'a>(
         &'a self,
         request: Request<'a>,
-        on_text: &'a (dyn Fn(&str) + Send + Sync),
+        progress: &'a (dyn Fn(Progress) + Send + Sync),
     ) -> BoxFuture<'a, Result<Completion>> {
         Box::pin(async move {
             let body = self.body(&request);
             let mut backoff = Duration::from_millis(250);
             for attempt in 0..=self.config.max_retries {
-                match self.attempt(&body, on_text).await {
+                let (error, wait, limited) = match self.attempt(&body, progress).await {
                     Ok(completion) => return Ok(completion),
                     Err(Failure::Fatal(error)) => return Err(error),
-                    Err(Failure::Retry(error, wait)) => {
-                        if attempt == self.config.max_retries {
-                            return Err(error);
-                        }
-                        tokio::time::sleep(wait.unwrap_or(backoff)).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(30));
-                    }
+                    Err(Failure::Retry(error, wait)) => (error, wait, false),
+                    Err(Failure::RateLimited(error, wait)) => (error, wait, true),
+                };
+                if attempt == self.config.max_retries {
+                    return Err(error);
+                }
+                let wait = wait.unwrap_or(backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+                if limited {
+                    let until = (SystemTime::now() + wait).duration_since(UNIX_EPOCH).unwrap_or_default();
+                    progress(Progress::RateLimited { until: Some(until.as_millis() as u64) });
+                }
+                tokio::time::sleep(wait).await;
+                if limited {
+                    progress(Progress::RateLimited { until: None });
                 }
             }
             bail!("no attempts made")

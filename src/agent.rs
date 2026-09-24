@@ -123,7 +123,22 @@ pub struct AgentRecord {
 /// Live events for observers. Text deltas are never persisted; items are.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Observation {
-    State { agent: String, state: AgentState },
-    Item { agent: String, entry: Entry },
-    TextDelta { agent: String, text: String },
+    State {
+        agent: String,
+        state: AgentState,
+    },
+    Item {
+        agent: String,
+        entry: Entry,
+    },
+    TextDelta {
+        agent: String,
+        text: String,
+    },
+    /// The provider rate-limited the agent's model call until this time (Unix milliseconds);
+    /// `None` once the call goes on, however it ends.
+    RateLimited {
+        agent: String,
+        until: Option<u64>,
+    },
 }

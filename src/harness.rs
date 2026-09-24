@@ -4,7 +4,7 @@
 
 use crate::agent::{AgentRecord, AgentSpec, AgentState, Entry, Item, Observation};
 use crate::machine::{Direct, Machine, MachineSpec};
-use crate::provider::{Provider, Request, ToolSpec};
+use crate::provider::{Completion, Progress, Provider, Request, ToolSpec};
 use crate::store::{Store, Transcript};
 use crate::tools::{Mailbox, Reply, Tool, ToolContext, ToolOutput};
 use anyhow::{Context, Result, bail};
@@ -12,6 +12,7 @@ use erissandbox::{Host, Sandboxes};
 use futures_util::future::BoxFuture;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Notify, Semaphore, broadcast};
@@ -400,6 +401,38 @@ impl Harness {
     }
 
     /// Delivers mail and runs model calls and tools until nothing awaits an answer.
+    /// One model call, with its progress forwarded to observers: streamed text when `stream`,
+    /// and rate limits, which always end with `RateLimited { until: None }`. `None` when the
+    /// turn is cancelled.
+    async fn call_model(
+        &self,
+        agent: &str,
+        provider: &dyn Provider,
+        request: Request<'_>,
+        stream: bool,
+        cancel: &CancellationToken,
+    ) -> Result<Option<Completion>> {
+        let limited = AtomicBool::new(false);
+        let progress = |progress: Progress| match progress {
+            Progress::Text(text) if stream => {
+                self.observe(Observation::TextDelta { agent: agent.to_owned(), text: text.to_owned() })
+            }
+            Progress::Text(_) => {}
+            Progress::RateLimited { until } => {
+                limited.store(until.is_some(), Ordering::Relaxed);
+                self.observe(Observation::RateLimited { agent: agent.to_owned(), until });
+            }
+        };
+        let completion = tokio::select! {
+            completion = provider.complete(request, &progress) => completion.map(Some),
+            _ = cancel.cancelled() => Ok(None),
+        };
+        if limited.load(Ordering::Relaxed) {
+            self.observe(Observation::RateLimited { agent: agent.to_owned(), until: None });
+        }
+        completion
+    }
+
     async fn turn(&self, agent: &str, cancel: &CancellationToken) -> Result<Ended> {
         let record = self.agent(agent)?;
         let spec = &record.spec;
@@ -447,9 +480,10 @@ impl Harness {
             if spec.context_window.is_some_and(|window| context * 10 > window * 8) {
                 let mut items: Vec<Item> = visible(&transcript).iter().map(|e| e.item.clone()).collect();
                 items.push(Item::Input { from: "user".into(), text: COMPACT.into() });
-                let completion = tokio::select! {
-                    completion = provider.complete(request(&system, &[], &items), &|_| {}) => completion?,
-                    _ = cancel.cancelled() => continue,
+                let Some(completion) =
+                    self.call_model(agent, &**provider, request(&system, &[], &items), false, cancel).await?
+                else {
+                    continue;
                 };
                 self.store.add_usage(agent, completion.usage, 0)?;
                 context = 0;
@@ -462,12 +496,11 @@ impl Harness {
                 self.append(agent, &mut transcript, Item::Compaction { summary }, None)?;
                 continue;
             }
-            let on_text =
-                |text: &str| self.observe(Observation::TextDelta { agent: agent.to_owned(), text: text.to_owned() });
             let items: Vec<Item> = visible(&transcript).iter().map(|e| e.item.clone()).collect();
-            let completion = tokio::select! {
-                completion = provider.complete(request(&system, &tool_specs, &items), &on_text) => completion?,
-                _ = cancel.cancelled() => continue,
+            let Some(completion) =
+                self.call_model(agent, &**provider, request(&system, &tool_specs, &items), true, cancel).await?
+            else {
+                continue;
             };
             drop(items);
             context = completion.usage.input;

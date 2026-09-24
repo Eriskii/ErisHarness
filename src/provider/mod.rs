@@ -31,13 +31,21 @@ pub struct Completion {
     pub usage: Usage,
 }
 
+/// What a model call reports while it runs.
+pub enum Progress<'a> {
+    /// Assistant text as it streams.
+    Text(&'a str),
+    /// The provider rate-limited the call, which waits until this time (Unix milliseconds)
+    /// before trying again; `None` once it tries again.
+    RateLimited { until: Option<u64> },
+}
+
 pub trait Provider: Send + Sync {
-    /// Runs one model call. `on_text` receives assistant text as it streams. Dropping the
-    /// future cancels the call.
+    /// Runs one model call, reporting its [`Progress`]. Dropping the future cancels the call.
     fn complete<'a>(
         &'a self,
         request: Request<'a>,
-        on_text: &'a (dyn Fn(&str) + Send + Sync),
+        progress: &'a (dyn Fn(Progress) + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<Completion>>;
 }
 

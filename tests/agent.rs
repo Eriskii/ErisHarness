@@ -180,13 +180,28 @@ fn rate_limits_are_retried_after_the_advertised_delay(f: &Fixture) -> Result<(),
         says("finally"),
     ]);
     let h = harness(f, &f.host_dir("retry"), &model);
+    let mut observations = h.subscribe();
     let agent = h.create_agent(spec(f)).unwrap();
     let started = std::time::Instant::now();
+    let asked = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
     h.send(&agent, "user", "go").unwrap();
     wait_for(&h, &agent, AgentState::Idle)?;
     check(model.requests().len() == 3, "expected three attempts")?;
     check(started.elapsed() >= Duration::from_millis(300), "retry-after ignored")?;
-    check(matches!(items(&h, &agent).last(), Some(Item::Assistant { text }) if text == "finally"), "no answer")
+    check(matches!(items(&h, &agent).last(), Some(Item::Assistant { text }) if text == "finally"), "no answer")?;
+    // Only the 429 is a rate limit; the 503 is retried without one.
+    let mut limits = Vec::new();
+    while let Ok(observation) = observations.try_recv() {
+        if let Observation::RateLimited { agent: a, until } = observation
+            && a == agent
+        {
+            limits.push(until);
+        }
+    }
+    check(
+        matches!(limits.as_slice(), [Some(until), None] if (asked + 300..asked + 2000).contains(until)),
+        format!("{limits:?}"),
+    )
 }
 
 fn provider_failures_leave_the_agent_failed_and_retryable(f: &Fixture) -> Result<(), Failed> {

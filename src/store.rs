@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS agents (
     cached_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
     reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    context_tokens INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS inbox (
@@ -77,7 +78,8 @@ impl Store {
     pub fn agent(&self, id: &str) -> Result<Option<AgentRecord>> {
         let db = self.db.lock().unwrap();
         db.query_row(
-            "SELECT spec, state, error, held, input_tokens, cached_tokens, output_tokens, reasoning_tokens FROM agents WHERE id = ?1",
+            "SELECT spec, state, error, held, input_tokens, cached_tokens, output_tokens, reasoning_tokens, context_tokens
+             FROM agents WHERE id = ?1",
             [id],
             |row| {
                 Ok((
@@ -91,11 +93,12 @@ impl Store {
                         output: row.get::<_, i64>(6)? as u64,
                         reasoning: row.get::<_, i64>(7)? as u64,
                     },
+                    row.get::<_, i64>(8)? as u64,
                 ))
             },
         )
         .optional()?
-        .map(|(spec, state, error, held, usage)| {
+        .map(|(spec, state, error, held, usage, context_tokens)| {
             Ok(AgentRecord {
                 id: id.to_owned(),
                 spec: serde_json::from_str(&spec)?,
@@ -103,6 +106,7 @@ impl Store {
                 error,
                 held,
                 usage,
+                context_tokens,
             })
         })
         .transpose()
@@ -121,13 +125,57 @@ impl Store {
         Ok(())
     }
 
-    pub fn add_usage(&self, id: &str, usage: Usage) -> Result<()> {
+    /// Adds a request's usage to the totals and records how full the context now is.
+    pub fn add_usage(&self, id: &str, usage: Usage, context: u64) -> Result<()> {
         self.db.lock().unwrap().execute(
             "UPDATE agents SET input_tokens = input_tokens + ?2, cached_tokens = cached_tokens + ?3,
-             output_tokens = output_tokens + ?4, reasoning_tokens = reasoning_tokens + ?5 WHERE id = ?1",
-            params![id, usage.input as i64, usage.cached_input as i64, usage.output as i64, usage.reasoning as i64],
+             output_tokens = output_tokens + ?4, reasoning_tokens = reasoning_tokens + ?5, context_tokens = ?6
+             WHERE id = ?1",
+            params![
+                id,
+                usage.input as i64,
+                usage.cached_input as i64,
+                usage.output as i64,
+                usage.reasoning as i64,
+                context as i64
+            ],
         )?;
         Ok(())
+    }
+
+    pub fn set_spec(&self, id: &str, spec: &AgentSpec) -> Result<()> {
+        self.db
+            .lock()
+            .unwrap()
+            .execute("UPDATE agents SET spec = ?2 WHERE id = ?1", params![id, serde_json::to_string(spec)?])?;
+        Ok(())
+    }
+
+    pub fn remove_agent(&self, id: &str) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let transaction = db.transaction()?;
+        transaction.execute("DELETE FROM inbox WHERE agent = ?1", [id])?;
+        transaction.execute("DELETE FROM agents WHERE id = ?1", [id])?;
+        transaction.commit()?;
+        drop(db);
+        match fs::remove_dir_all(self.transcripts.join(id)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// The first unread mail for `agent` from `from` newer than `after`.
+    pub fn reply(&self, agent: &str, from: &str, after: i64) -> Result<Option<Mail>> {
+        let db = self.db.lock().unwrap();
+        let mut statement = db.prepare_cached(
+            "SELECT id, sender, body FROM inbox WHERE agent = ?1 AND sender = ?2 AND id > ?3 AND delivered_seq IS NULL
+             ORDER BY id LIMIT 1",
+        )?;
+        Ok(statement
+            .query_row(params![agent, from, after], |row| {
+                Ok(Mail { id: row.get(0)?, from: row.get(1)?, text: row.get(2)? })
+            })
+            .optional()?)
     }
 
     /// Agents a restarted harness must wake: those mid-turn, and those with unheld mail.
@@ -148,6 +196,11 @@ impl Store {
             params![agent, from, text, now_ms() as i64],
         )?;
         Ok(db.last_insert_rowid())
+    }
+
+    /// The newest mail id so far.
+    pub fn last_mail(&self) -> Result<i64> {
+        Ok(self.db.lock().unwrap().query_row("SELECT COALESCE(MAX(id), 0) FROM inbox", [], |row| row.get(0))?)
     }
 
     pub fn pending(&self, agent: &str) -> Result<Vec<Mail>> {

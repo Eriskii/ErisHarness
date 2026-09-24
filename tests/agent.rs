@@ -40,6 +40,9 @@ fn spec(f: &Fixture) -> AgentSpec {
         system_prompt: "You are a test agent.".into(),
         tools: vec!["read".into(), "bash".into(), "edit".into(), "write".into(), "send_message".into()],
         provider: "test".into(),
+        model: "test-model".into(),
+        reasoning_effort: Some("low".into()),
+        context_window: None,
         machine: MachineSpec::Sandbox(f.spec()),
     }
 }

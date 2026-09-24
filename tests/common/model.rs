@@ -4,7 +4,7 @@ use super::{block_on, runtime};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use erisharness::provider::{Responses, ResponsesConfig, StaticToken};
+use erisharness::provider::{Credentials, Responses, ResponsesConfig, StaticToken};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -23,6 +23,7 @@ pub struct Script {
     pub replies: VecDeque<Reply>,
     pub requests: Vec<Value>,
     pub auth: Vec<String>,
+    pub headers: Vec<HeaderMap>,
 }
 
 pub type Shared = Arc<Mutex<Script>>;
@@ -47,15 +48,21 @@ impl Model {
     }
 
     pub fn provider(&self) -> Arc<Responses> {
+        self.provider_with(Arc::new(StaticToken("secret-token".into())))
+    }
+
+    pub fn provider_with(&self, credentials: Arc<dyn Credentials>) -> Arc<Responses> {
         Arc::new(Responses::new(ResponsesConfig {
             base_url: self.url.clone(),
-            model: "test-model".into(),
-            reasoning_effort: Some("low".into()),
             headers: vec![("x-test".into(), "1".into())],
             store: false,
             max_retries: 3,
-            credentials: Arc::new(StaticToken("secret-token".into())),
+            credentials,
         }))
+    }
+
+    pub fn push(&self, reply: Reply) {
+        self.script.lock().unwrap().replies.push_back(reply);
     }
 }
 
@@ -64,6 +71,7 @@ async fn respond(State(script): State<Shared>, headers: HeaderMap, body: String)
         let mut script = script.lock().unwrap();
         script.requests.push(serde_json::from_str(&body).unwrap());
         script.auth.push(headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned());
+        script.headers.push(headers);
         script.replies.pop_front()
     };
     let events = match reply {

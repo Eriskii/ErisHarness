@@ -83,14 +83,10 @@ async fn read(context: &ToolContext, args: &Value) -> Result<ToolOutput, String>
         }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
         reader.read_to_end(&mut bytes).await.map_err(|e| errors::node(&e, "read", ""))?;
-        return Ok(ToolOutput {
-            content: vec![
-                Content::Text(format!("Read image file [{mime}]")),
-                Content::Image { mime: mime.to_owned(), data: base64::engine::general_purpose::STANDARD.encode(bytes) },
-            ],
-            is_error: false,
-            details: Value::Null,
-        });
+        return Ok(ToolOutput::new(vec![
+            Content::Text(format!("Read image file [{mime}]")),
+            Content::Image { mime: mime.to_owned(), data: base64::engine::general_purpose::STANDARD.encode(bytes) },
+        ]));
     }
     let start = offset.map_or(0, |o| (o - 1.0).max(0.0) as usize);
     let wanted = limit.map(|l| l.max(0.0) as usize);

@@ -12,6 +12,11 @@ pub struct AgentSpec {
     pub tools: Vec<String>,
     /// Name of a registered provider.
     pub provider: String,
+    pub model: String,
+    pub reasoning_effort: Option<String>,
+    /// The model's context size in tokens. When a request would start above 80% of it, the
+    /// transcript so far is compacted into a summary first.
+    pub context_window: Option<u64>,
     pub machine: MachineSpec,
 }
 
@@ -71,6 +76,11 @@ pub enum Item {
         call_id: String,
         output: ToolOutput,
     },
+    /// Everything before this item, summarized. The model sees only the summary and what
+    /// follows it.
+    Compaction {
+        summary: String,
+    },
 }
 
 /// A transcript line: one JSON object per line of `transcript.jsonl`.
@@ -103,6 +113,8 @@ pub struct AgentRecord {
     /// Interrupted: mail waits until the user writes again.
     pub held: bool,
     pub usage: Usage,
+    /// Input tokens of the latest model request: how full the context is.
+    pub context_tokens: u64,
 }
 
 /// Live events for observers. Text deltas are never persisted; items are.

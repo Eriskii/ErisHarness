@@ -39,11 +39,18 @@ pub struct ToolOutput {
     /// For observers such as a UI; never sent to the model.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub details: Value,
+    /// Inbox mail this result hands to the agent, which is then not delivered again.
+    #[serde(skip)]
+    pub(crate) delivers: Option<i64>,
 }
 
 impl ToolOutput {
+    pub fn new(content: Vec<Content>) -> Self {
+        Self { content, is_error: false, details: Value::Null, delivers: None }
+    }
+
     pub fn text(text: impl Into<String>) -> Self {
-        Self { content: vec![Content::Text(text.into())], is_error: false, details: Value::Null }
+        Self::new(vec![Content::Text(text.into())])
     }
 
     pub fn error(text: impl Into<String>) -> Self {
@@ -58,7 +65,15 @@ impl ToolOutput {
 
 /// Delivers mail between agents. The harness implements it over its inboxes.
 pub trait Mailbox: Send + Sync {
-    fn send(&self, from: &str, to: &str, text: &str) -> anyhow::Result<()>;
+    /// Queues mail. Returns a position in the inbox order: replies to it come after it.
+    fn send(&self, from: &str, to: &str, text: &str) -> anyhow::Result<i64>;
+    /// Waits for unread mail to `agent` from `from` that came after `after`.
+    fn reply<'a>(&'a self, agent: &'a str, from: &'a str, after: i64) -> BoxFuture<'a, anyhow::Result<Reply>>;
+}
+
+pub struct Reply {
+    pub id: i64,
+    pub text: String,
 }
 
 /// Everything a tool call may touch.

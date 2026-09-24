@@ -37,19 +37,36 @@ inbox (SQLite)  ──wake──▶  turn task  ──▶ provider ──▶ ite
 
 - **Agents** are rows in `harness.db` plus `transcripts/<id>/transcript.jsonl`. The
   transcript is the whole context. Only finished items are written; streaming text goes to
-  observers only.
+  observers only. Each agent's spec names its provider, model, reasoning effort, tools,
+  prompt and machine; `update_agent` changes it for the next turn, and `remove_agent` stops
+  the agent and deletes everything it had.
 - **Mail** is the only way to make an agent act. `Harness::send` from `"user"` or another
   agent's id queues a message. An idle agent starts a turn. A busy agent receives it at its
   next tool boundary. After `interrupt`, mail is held until the user writes again. The
   `send_message` tool takes the same path.
+- **Waiting for replies.** `send_message` with `wait` blocks until the recipient's next
+  message to the sender, which becomes the call's result instead of arriving as mail. An
+  optional `timeout_seconds` ends the wait early, and an interrupt ends it too; the reply
+  then arrives as mail. The claimed message is marked delivered only after the result is in
+  the transcript, and the result records its event id, so a crash neither loses nor repeats it.
+- **Recipients** outside the harness, such as the user, are registered with
+  `HarnessBuilder::recipient(name, recipient)`. Mail to that name goes to the `Recipient`;
+  replies come back through `Harness::send` with the name as the sender, and end waits the
+  same way.
 - **Turns** load the transcript, call the provider, run tool calls, and repeat until the
   model answers with no calls. Then everything is dropped. A restarted harness resumes agents
   that were mid-turn: calls without results get an interruption result, and delivery is
   idempotent via event ids in the transcript.
+- **Compaction.** With `context_window` set, a request that would start above 80% of it is
+  preceded by one that asks the model to summarize the conversation. The summary is appended
+  as a `Compaction` item; from then on the model sees the summary and what follows it. The
+  transcript keeps everything. `AgentRecord::context_tokens` is the latest request's input
+  size.
 - **Providers** implement `Provider`. `Responses` speaks the OpenAI Responses API (streaming,
-  `store: false`, encrypted reasoning carried forward) with configurable endpoint, model,
-  effort, headers and credentials. It retries 429s and 5xx, honoring `retry-after-ms` and
-  `retry-after`.
+  `store: false`, encrypted reasoning carried forward, the agent id as `prompt_cache_key`)
+  with a configurable endpoint and headers. `Credentials::authorize` supplies the token and
+  any per-account headers for each request, so refreshable logins stay outside the harness.
+  It retries 429s and 5xx, honoring `retry-after-ms` and `retry-after`.
 - **Tools** implement `Tool`. `tools::builtin()` is Pi 0.87's `read`, `bash`, `edit`, `write`,
   with Pi's exact model-facing text, plus `send_message`.
 

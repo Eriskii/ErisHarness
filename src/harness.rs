@@ -6,14 +6,15 @@ use crate::agent::{AgentRecord, AgentSpec, AgentState, Entry, Item, Observation}
 use crate::machine::{Direct, Machine, MachineSpec};
 use crate::provider::{Provider, Request, ToolSpec};
 use crate::store::{Store, Transcript};
-use crate::tools::{Mailbox, Tool, ToolContext, ToolOutput};
+use crate::tools::{Mailbox, Reply, Tool, ToolContext, ToolOutput};
 use anyhow::{Context, Result, bail};
 use erissandbox::{Host, Sandboxes};
+use futures_util::future::BoxFuture;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{Semaphore, broadcast};
+use tokio::sync::{Notify, Semaphore, broadcast};
 use tokio_util::sync::CancellationToken;
 
 pub struct HarnessBuilder {
@@ -22,8 +23,15 @@ pub struct HarnessBuilder {
     transcripts: Option<PathBuf>,
     providers: HashMap<String, Arc<dyn Provider>>,
     tools: HashMap<String, Arc<dyn Tool>>,
+    recipients: HashMap<String, Arc<dyn Recipient>>,
     max_turns: usize,
     idle_grace: Duration,
+}
+
+/// Someone outside the harness that agents can message by name, such as the user. Replies
+/// come back through [`Harness::send`] with that name as the sender.
+pub trait Recipient: Send + Sync {
+    fn deliver(&self, from: &str, text: &str) -> Result<()>;
 }
 
 impl HarnessBuilder {
@@ -55,6 +63,12 @@ impl HarnessBuilder {
         tools.into_iter().fold(self, Self::tool)
     }
 
+    /// Mail agents send to `name` goes to `recipient` instead of an inbox.
+    pub fn recipient(mut self, name: &str, recipient: Arc<dyn Recipient>) -> Self {
+        self.recipients.insert(name.to_owned(), recipient);
+        self
+    }
+
     /// Turns that may run at once; further woken agents wait for a slot.
     pub fn max_concurrent_turns(mut self, turns: usize) -> Self {
         self.max_turns = turns;
@@ -82,6 +96,8 @@ impl HarnessBuilder {
             sandboxes,
             providers: self.providers,
             tools: self.tools,
+            recipients: self.recipients,
+            waiting: Mutex::default(),
             turns: Arc::new(Semaphore::new(self.max_turns)),
             running: Mutex::default(),
             observations,
@@ -105,6 +121,9 @@ pub struct Harness {
     sandboxes: Option<Sandboxes>,
     providers: HashMap<String, Arc<dyn Provider>>,
     tools: HashMap<String, Arc<dyn Tool>>,
+    recipients: HashMap<String, Arc<dyn Recipient>>,
+    /// Agents blocked in a wait for a reply, signalled when their mail arrives.
+    waiting: Mutex<HashMap<String, Arc<Notify>>>,
     turns: Arc<Semaphore>,
     running: Mutex<HashMap<String, Run>>,
     observations: broadcast::Sender<Observation>,
@@ -118,9 +137,25 @@ pub struct Harness {
 struct Inboxes(std::sync::Weak<Harness>);
 
 impl Mailbox for Inboxes {
-    fn send(&self, from: &str, to: &str, text: &str) -> Result<()> {
+    fn send(&self, from: &str, to: &str, text: &str) -> Result<i64> {
         let harness = self.0.upgrade().context("harness stopped")?;
-        harness.send(to, from, text).map(drop)
+        harness.send(to, from, text)
+    }
+
+    fn reply<'a>(&'a self, agent: &'a str, from: &'a str, after: i64) -> BoxFuture<'a, Result<Reply>> {
+        Box::pin(async move {
+            let harness = self.0.upgrade().context("harness stopped")?;
+            harness.await_reply(agent, from, after).await
+        })
+    }
+}
+
+/// Unregisters a waiting agent however its wait ends.
+struct Waiting<'a>(&'a Harness, &'a str);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.waiting.lock().unwrap().remove(self.1);
     }
 }
 
@@ -132,6 +167,16 @@ enum Ended {
 
 const INTERRUPTED_CALL: &str = "Tool call was interrupted before it finished.";
 const SKIPPED_CALL: &str = "Tool call skipped: the turn was interrupted.";
+const COMPACT: &str = "Your context is nearly full, so this conversation will be replaced by a summary you write now. \
+Write that summary for yourself: the task and who gave it, what has been done, the current state, key facts, \
+file paths, decisions and their reasons, open questions, and what remains to do. Include everything needed to \
+continue without the conversation. Reply with the summary only.";
+
+/// What the model sees: everything from the latest compaction on.
+fn visible(transcript: &Transcript) -> &[Entry] {
+    let start = transcript.entries.iter().rposition(|e| matches!(e.item, Item::Compaction { .. })).unwrap_or(0);
+    &transcript.entries[start..]
+}
 
 impl Harness {
     pub fn builder(dir: impl AsRef<Path>) -> HarnessBuilder {
@@ -141,12 +186,20 @@ impl Harness {
             transcripts: None,
             providers: HashMap::new(),
             tools: HashMap::new(),
+            recipients: HashMap::new(),
             max_turns: 1024,
             idle_grace: Duration::from_secs(10),
         }
     }
 
     pub fn create_agent(&self, spec: AgentSpec) -> Result<String> {
+        self.validate(&spec)?;
+        let id = uuid::Uuid::now_v7().simple().to_string();
+        self.store.create_agent(&id, &spec)?;
+        Ok(id)
+    }
+
+    fn validate(&self, spec: &AgentSpec) -> Result<()> {
         if !self.providers.contains_key(&spec.provider) {
             bail!("unknown provider {}", spec.provider);
         }
@@ -156,9 +209,32 @@ impl Harness {
         if matches!(spec.machine, MachineSpec::Sandbox(_)) && self.sandboxes.is_none() {
             bail!("sandboxes are not enabled; open the harness with HarnessBuilder::sandboxes");
         }
-        let id = uuid::Uuid::now_v7().simple().to_string();
-        self.store.create_agent(&id, &spec)?;
-        Ok(id)
+        Ok(())
+    }
+
+    /// Changes an agent's spec. A running turn keeps the old one; the next turn uses this.
+    pub fn update_agent(&self, id: &str, update: impl FnOnce(&mut AgentSpec)) -> Result<()> {
+        let mut spec = self.agent(id)?.spec;
+        update(&mut spec);
+        self.validate(&spec)?;
+        self.store.set_spec(id, &spec)
+    }
+
+    /// Stops the agent and deletes its record, mail, transcript and sandbox.
+    pub async fn remove_agent(&self, id: &str) -> Result<()> {
+        self.agent(id)?;
+        let task = self.running.lock().unwrap().get_mut(id).and_then(|run| {
+            run.cancel.cancel();
+            run.task.take()
+        });
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+        self.running.lock().unwrap().remove(id);
+        if let Some(sandboxes) = &self.sandboxes {
+            sandboxes.destroy(id).await?;
+        }
+        self.store.remove_agent(id)
     }
 
     pub fn agent(&self, id: &str) -> Result<AgentRecord> {
@@ -184,9 +260,19 @@ impl Harness {
 
     /// Queues a message for `agent` from `"user"` or another agent's id. A user message
     /// releases mail held by an interrupt.
+    ///
+    /// Mail to a [`Recipient`]'s name goes to it. The result orders the mail: replies to it
+    /// come after it.
     pub fn send(self: &Arc<Self>, agent: &str, from: &str, text: &str) -> Result<i64> {
+        if let Some(recipient) = self.recipients.get(agent) {
+            recipient.deliver(from, text)?;
+            return self.store.last_mail();
+        }
         let record = self.agent(agent)?;
         let id = self.store.enqueue(agent, from, text)?;
+        if let Some(waiting) = self.waiting.lock().unwrap().get(agent) {
+            waiting.notify_waiters();
+        }
         if from == "user" && record.held {
             self.store.set_held(agent, false)?;
         }
@@ -194,6 +280,20 @@ impl Harness {
             self.wake(agent);
         }
         Ok(id)
+    }
+
+    async fn await_reply(&self, agent: &str, from: &str, after: i64) -> Result<Reply> {
+        let notify = self.waiting.lock().unwrap().entry(agent.to_owned()).or_default().clone();
+        let _waiting = Waiting(self, agent);
+        loop {
+            let arrived = notify.notified();
+            tokio::pin!(arrived);
+            arrived.as_mut().enable();
+            if let Some(mail) = self.store.reply(agent, from, after)? {
+                return Ok(Reply { id: mail.id, text: mail.text });
+            }
+            arrived.await;
+        }
     }
 
     /// Stops the agent's current turn. Mail stays queued until the user writes again.
@@ -302,28 +402,58 @@ impl Harness {
             MachineSpec::Direct(direct) => Arc::new(Direct::new(direct.clone())),
         };
         let mut announced = record.state == AgentState::Running;
+        let mut context = record.context_tokens;
         loop {
             if cancel.is_cancelled() {
                 return Ok(if self.closing.is_cancelled() { Ended::Closing } else { Ended::Interrupted });
             }
             self.deliver(agent, &mut transcript)?;
-            if !matches!(transcript.items().last(), Some(Item::Input { .. } | Item::ToolResult { .. })) {
+            if !matches!(
+                transcript.items().last(),
+                Some(Item::Input { .. } | Item::ToolResult { .. } | Item::Compaction { .. })
+            ) {
                 return Ok(Ended::Idle);
             }
             if !announced {
                 self.set_state(agent, AgentState::Running, None);
                 announced = true;
             }
+            let request = |system, tools, items| Request {
+                model: &spec.model,
+                reasoning_effort: spec.reasoning_effort.as_deref(),
+                cache_key: agent,
+                system,
+                tools,
+                items,
+            };
+            if spec.context_window.is_some_and(|window| context * 10 > window * 8) {
+                let mut items: Vec<Item> = visible(&transcript).iter().map(|e| e.item.clone()).collect();
+                items.push(Item::Input { from: "user".into(), text: COMPACT.into() });
+                let completion = tokio::select! {
+                    completion = provider.complete(request(&system, &[], &items), &|_| {}) => completion?,
+                    _ = cancel.cancelled() => continue,
+                };
+                self.store.add_usage(agent, completion.usage, 0)?;
+                context = 0;
+                let summary = completion
+                    .items
+                    .iter()
+                    .filter_map(|item| if let Item::Assistant { text } = item { Some(text.as_str()) } else { None })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.append(agent, &mut transcript, Item::Compaction { summary }, None)?;
+                continue;
+            }
             let on_text =
                 |text: &str| self.observe(Observation::TextDelta { agent: agent.to_owned(), text: text.to_owned() });
-            let items: Vec<Item> = transcript.items().cloned().collect();
-            let request = Request { system: &system, tools: &tool_specs, items: &items };
+            let items: Vec<Item> = visible(&transcript).iter().map(|e| e.item.clone()).collect();
             let completion = tokio::select! {
-                completion = provider.complete(request, &on_text) => completion?,
+                completion = provider.complete(request(&system, &tool_specs, &items), &on_text) => completion?,
                 _ = cancel.cancelled() => continue,
             };
             drop(items);
-            self.store.add_usage(agent, completion.usage)?;
+            context = completion.usage.input;
+            self.store.add_usage(agent, completion.usage, context)?;
             let mut calls = Vec::new();
             for item in completion.items {
                 if let Item::ToolCall { call_id, name, arguments } = &item {
@@ -343,7 +473,12 @@ impl Harness {
                 } else {
                     call_tool(&tools, &context, &name, &arguments).await
                 };
-                self.append(agent, &mut transcript, Item::ToolResult { call_id, output }, None)?;
+                let delivers = output.delivers;
+                let seq = transcript.entries.len() as u64;
+                self.append(agent, &mut transcript, Item::ToolResult { call_id, output }, delivers)?;
+                if let Some(mail) = delivers {
+                    self.store.delivered(&[(mail, seq)])?;
+                }
             }
         }
     }

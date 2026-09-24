@@ -58,8 +58,17 @@ enum Mode {
 struct NoMail;
 
 impl erisharness::tools::Mailbox for NoMail {
-    fn send(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> {
+    fn send(&self, _: &str, _: &str, _: &str) -> anyhow::Result<i64> {
         anyhow::bail!("no mail in tool tests")
+    }
+
+    fn reply<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+        _: i64,
+    ) -> futures_util::future::BoxFuture<'a, anyhow::Result<erisharness::tools::Reply>> {
+        Box::pin(async { anyhow::bail!("no mail in tool tests") })
     }
 }
 

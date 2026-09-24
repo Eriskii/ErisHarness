@@ -17,6 +17,10 @@ pub struct ToolSpec {
 }
 
 pub struct Request<'a> {
+    pub model: &'a str,
+    pub reasoning_effort: Option<&'a str>,
+    /// Stable per conversation, so the provider can reuse its prompt cache.
+    pub cache_key: &'a str,
     pub system: &'a str,
     pub tools: &'a [ToolSpec],
     pub items: &'a [Item],
@@ -37,15 +41,21 @@ pub trait Provider: Send + Sync {
     ) -> BoxFuture<'a, anyhow::Result<Completion>>;
 }
 
-/// Supplies the bearer token for each request, so refreshable credentials stay outside.
+pub struct Authorization {
+    pub token: String,
+    /// Sent along with the token, such as an account id.
+    pub headers: Vec<(String, String)>,
+}
+
+/// Authorizes each request, so refreshable credentials stay outside the harness.
 pub trait Credentials: Send + Sync {
-    fn token(&self) -> BoxFuture<'_, anyhow::Result<String>>;
+    fn authorize(&self) -> BoxFuture<'_, anyhow::Result<Authorization>>;
 }
 
 pub struct StaticToken(pub String);
 
 impl Credentials for StaticToken {
-    fn token(&self) -> BoxFuture<'_, anyhow::Result<String>> {
-        Box::pin(async move { Ok(self.0.clone()) })
+    fn authorize(&self) -> BoxFuture<'_, anyhow::Result<Authorization>> {
+        Box::pin(async move { Ok(Authorization { token: self.0.clone(), headers: Vec::new() }) })
     }
 }

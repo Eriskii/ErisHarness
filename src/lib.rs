@@ -9,4 +9,4 @@ pub mod provider;
 mod store;
 pub mod tools;
 
-pub use harness::{Harness, HarnessBuilder};
+pub use harness::{Harness, HarnessBuilder, Recipient};

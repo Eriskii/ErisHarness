@@ -16,8 +16,6 @@ use std::time::Duration;
 pub struct ResponsesConfig {
     /// Endpoint root; requests go to `{base_url}/responses`.
     pub base_url: String,
-    pub model: String,
-    pub reasoning_effort: Option<String>,
     /// Sent with every request, such as account or beta headers.
     pub headers: Vec<(String, String)>,
     /// Whether the provider keeps responses server-side.
@@ -39,7 +37,7 @@ impl Responses {
 
     fn body(&self, request: &Request) -> Value {
         let mut body = json!({
-            "model": self.config.model,
+            "model": request.model,
             "instructions": request.system,
             "input": request.items.iter().filter_map(input_item).collect::<Vec<_>>(),
             "tools": request.tools.iter().map(|t| json!({
@@ -50,8 +48,9 @@ impl Responses {
             "parallel_tool_calls": true,
             "stream": true,
             "store": self.config.store,
+            "prompt_cache_key": request.cache_key,
         });
-        if let Some(effort) = &self.config.reasoning_effort {
+        if let Some(effort) = request.reasoning_effort {
             body["reasoning"] = json!({"effort": effort, "summary": "auto"});
         }
         if !self.config.store {
@@ -61,13 +60,13 @@ impl Responses {
     }
 
     async fn attempt(&self, body: &Value, on_text: &(dyn Fn(&str) + Send + Sync)) -> Result<Completion, Failure> {
-        let token = self.config.credentials.token().await.map_err(Failure::Fatal)?;
+        let authorization = self.config.credentials.authorize().await.map_err(Failure::Fatal)?;
         let mut builder = self
             .client
             .post(format!("{}/responses", self.config.base_url.trim_end_matches('/')))
-            .bearer_auth(token)
+            .bearer_auth(&authorization.token)
             .json(body);
-        for (key, value) in &self.config.headers {
+        for (key, value) in self.config.headers.iter().chain(&authorization.headers) {
             builder = builder.header(key, value);
         }
         let response = builder.send().await.map_err(|e| Failure::Retry(anyhow!(e), None))?;
@@ -205,6 +204,8 @@ fn input_item(item: &Item) -> Option<Value> {
         Item::ToolResult { call_id, output } => {
             json!({"type": "function_call_output", "call_id": call_id, "output": tool_output(output)})
         }
+        Item::Compaction { summary } => json!({"role": "user", "content": [{"type": "input_text", "text":
+            format!("The conversation so far was compacted. Summary:\n\n{summary}\n\nContinue from here.")}]}),
     })
 }
 

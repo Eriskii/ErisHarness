@@ -23,6 +23,9 @@ fn direct(cwd: &Path) -> AgentSpec {
         system_prompt: "Direct agent.".into(),
         tools: vec!["read".into(), "bash".into(), "edit".into(), "write".into(), "send_message".into()],
         provider: "test".into(),
+        model: "test-model".into(),
+        reasoning_effort: Some("low".into()),
+        context_window: None,
         machine: MachineSpec::Direct(DirectSpec { cwd: cwd.to_str().unwrap().into(), env: None }),
     }
 }
@@ -133,6 +136,8 @@ fn sandboxed_agents_need_sandboxes_enabled() {
             hostname: String::new(),
             cwd: "/root".into(),
             env: SandboxSpec::default_env(),
+            devices: Vec::new(),
+            forwards: Vec::new(),
         }),
         ..direct(temp.path())
     };

@@ -135,10 +135,10 @@ pub enum Observation {
         agent: String,
         text: String,
     },
-    /// The provider rate-limited the agent's model call until this time (Unix milliseconds);
-    /// `None` once the call goes on, however it ends.
-    RateLimited {
+    /// The agent's model call is waiting, queued for a slot or rate-limited; `None` once the
+    /// call goes on, however it ends.
+    Held {
         agent: String,
-        until: Option<u64>,
+        hold: Option<crate::provider::Hold>,
     },
 }

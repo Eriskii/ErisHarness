@@ -6,6 +6,7 @@
 //! call until the provider's retry time, and each successful call adds a fraction of a slot,
 //! about one per round of successes.
 
+use super::Hold;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -44,22 +45,28 @@ impl RateGate {
         self.state.lock().unwrap().capacity
     }
 
-    /// Waits for a slot and for any pause to end. `report` hears when the call is held by a
-    /// rate limit, with the time it ends (Unix milliseconds), and `None` once it is not.
-    pub async fn acquire(self: &Arc<Self>, report: &(dyn Fn(Option<u64>) + Sync)) -> Permit {
+    /// Waits for a slot and for any pause to end. `report` hears each [`Hold`] as it begins,
+    /// and `None` once the call goes on; a call that never waits hears nothing.
+    pub async fn acquire(self: &Arc<Self>, report: &(dyn Fn(Option<Hold>) + Sync)) -> Permit {
         let mut pause = self.pause.subscribe();
         let mut shown = None;
-        let mut show = |until: Option<Instant>| {
-            if until != shown {
-                report(until.map(unix_millis));
-                shown = until;
+        let mut show = |hold: Option<Hold>| {
+            if hold != shown {
+                report(hold);
+                shown = hold;
             }
         };
+        let limited = |until: Instant| Hold::RateLimited { until: unix_millis(until) };
         let slot = self.slots.clone().acquire_owned();
         tokio::pin!(slot);
         let permit = loop {
             let until = active(*pause.borrow_and_update());
-            show(until);
+            tokio::select! {
+                biased;
+                permit = &mut slot => break permit.expect("the gate never closes"),
+                _ = std::future::ready(()) => {}
+            }
+            show(Some(until.map_or(Hold::Queued, limited)));
             tokio::select! {
                 biased;
                 permit = &mut slot => break permit.expect("the gate never closes"),
@@ -70,7 +77,7 @@ impl RateGate {
         loop {
             let until = active(*pause.borrow_and_update());
             let Some(until) = until else { break };
-            show(Some(until));
+            show(Some(limited(until)));
             tokio::select! {
                 _ = sleep_until(until) => {}
                 _ = pause.changed() => {}
@@ -155,21 +162,29 @@ mod tests {
     use super::*;
     use tokio::time::advance;
 
-    /// Whether each report was the start (`true`) or the end (`false`) of a wait.
-    type Seen = Arc<Mutex<Vec<bool>>>;
+    /// Each report: "queued", "limited", or "free" once the call goes on.
+    type Seen = Arc<Mutex<Vec<&'static str>>>;
 
-    fn reports() -> (Seen, impl Fn(Option<u64>) + Send + Sync + Clone) {
+    fn reports() -> (Seen, impl Fn(Option<Hold>) + Send + Sync + Clone) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
-        (seen, move |until: Option<u64>| sink.lock().unwrap().push(until.is_some()))
+        let report = move |hold: Option<Hold>| {
+            sink.lock().unwrap().push(match hold {
+                Some(Hold::Queued) => "queued",
+                Some(Hold::RateLimited { .. }) => "limited",
+                None => "free",
+            })
+        };
+        (seen, report)
     }
 
     #[tokio::test(start_paused = true)]
     async fn calls_wait_for_a_slot_in_the_order_they_came() {
         let gate = RateGate::new(2, 8);
-        let (_, report) = reports();
+        let (seen, report) = reports();
         let a = gate.acquire(&report).await;
         let _b = gate.acquire(&report).await;
+        assert!(seen.lock().unwrap().is_empty(), "a call with a free slot is never held");
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut waiting = Vec::new();
         for n in 0..3 {
@@ -188,6 +203,7 @@ mod tests {
             task.await.unwrap();
         }
         assert_eq!(*order.lock().unwrap(), [0, 1, 2]);
+        assert_eq!(*seen.lock().unwrap(), ["queued", "queued", "queued", "free", "free", "free"]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -212,7 +228,7 @@ mod tests {
         advance(Duration::from_secs(31)).await;
         let _next = next.await.unwrap();
         assert!(started.elapsed() >= Duration::from_secs(30));
-        assert_eq!(*seen.lock().unwrap(), [true, false], "the wait is reported and ends");
+        assert_eq!(*seen.lock().unwrap(), ["limited", "free"], "the wait is reported and ends");
         let mut running = Vec::new();
         for _ in 0..3 {
             running.push(gate.acquire(&report).await);
@@ -243,7 +259,7 @@ mod tests {
         a_limit_never_drops_below_one(&gate, &report).await;
     }
 
-    async fn a_limit_never_drops_below_one(gate: &Arc<RateGate>, report: &(impl Fn(Option<u64>) + Sync)) {
+    async fn a_limit_never_drops_below_one(gate: &Arc<RateGate>, report: &(impl Fn(Option<Hold>) + Sync)) {
         for _ in 0..4 {
             advance(Duration::from_secs(2)).await;
             gate.acquire(report).await.rate_limited(Duration::from_secs(1));
@@ -262,11 +278,12 @@ mod tests {
             async move { gate.acquire(&report).await }
         });
         tokio::task::yield_now().await;
+        assert_eq!(*seen.lock().unwrap(), ["queued"]);
         first.rate_limited(Duration::from_secs(10));
         tokio::task::yield_now().await;
-        assert_eq!(*seen.lock().unwrap(), [true]);
+        assert_eq!(*seen.lock().unwrap(), ["queued", "limited"]);
         advance(Duration::from_secs(11)).await;
         queued.await.unwrap();
-        assert_eq!(*seen.lock().unwrap(), [true, false]);
+        assert_eq!(*seen.lock().unwrap(), ["queued", "limited", "free"]);
     }
 }

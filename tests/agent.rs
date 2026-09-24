@@ -6,6 +6,7 @@ use common::model::{Model, Reply, calls, completed, says};
 use common::{Fixture, block_on};
 use erisharness::agent::{AgentSpec, AgentState, Item, Observation};
 use erisharness::machine::MachineSpec;
+use erisharness::provider::Hold;
 use erisharness::{Harness, tools};
 use libtest_mimic::Failed;
 use serde_json::{Value, json};
@@ -192,14 +193,14 @@ fn rate_limits_are_retried_after_the_advertised_delay(f: &Fixture) -> Result<(),
     // Only the 429 is a rate limit; the 503 is retried without one.
     let mut limits = Vec::new();
     while let Ok(observation) = observations.try_recv() {
-        if let Observation::RateLimited { agent: a, until } = observation
+        if let Observation::Held { agent: a, hold } = observation
             && a == agent
         {
-            limits.push(until);
+            limits.push(hold);
         }
     }
     check(
-        matches!(limits.as_slice(), [Some(until), None] if (asked + 300..asked + 2000).contains(until)),
+        matches!(limits.as_slice(), [Some(Hold::RateLimited { until }), None] if (asked + 300..asked + 2000).contains(until)),
         format!("{limits:?}"),
     )
 }

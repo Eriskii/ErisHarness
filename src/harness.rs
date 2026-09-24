@@ -402,8 +402,8 @@ impl Harness {
 
     /// Delivers mail and runs model calls and tools until nothing awaits an answer.
     /// One model call, with its progress forwarded to observers: streamed text when `stream`,
-    /// and rate limits, which always end with `RateLimited { until: None }`. `None` when the
-    /// turn is cancelled.
+    /// and holds, which always end with `Held { hold: None }`. `None` when the turn is
+    /// cancelled.
     async fn call_model(
         &self,
         agent: &str,
@@ -412,23 +412,23 @@ impl Harness {
         stream: bool,
         cancel: &CancellationToken,
     ) -> Result<Option<Completion>> {
-        let limited = AtomicBool::new(false);
+        let held = AtomicBool::new(false);
         let progress = |progress: Progress| match progress {
             Progress::Text(text) if stream => {
                 self.observe(Observation::TextDelta { agent: agent.to_owned(), text: text.to_owned() })
             }
             Progress::Text(_) => {}
-            Progress::RateLimited { until } => {
-                limited.store(until.is_some(), Ordering::Relaxed);
-                self.observe(Observation::RateLimited { agent: agent.to_owned(), until });
+            Progress::Held(hold) => {
+                held.store(hold.is_some(), Ordering::Relaxed);
+                self.observe(Observation::Held { agent: agent.to_owned(), hold });
             }
         };
         let completion = tokio::select! {
             completion = provider.complete(request, &progress) => completion.map(Some),
             _ = cancel.cancelled() => Ok(None),
         };
-        if limited.load(Ordering::Relaxed) {
-            self.observe(Observation::RateLimited { agent: agent.to_owned(), until: None });
+        if held.load(Ordering::Relaxed) {
+            self.observe(Observation::Held { agent: agent.to_owned(), hold: None });
         }
         completion
     }

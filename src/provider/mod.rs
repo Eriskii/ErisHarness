@@ -33,13 +33,21 @@ pub struct Completion {
     pub usage: Usage,
 }
 
+/// Why a model call is waiting instead of running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hold {
+    /// Every slot of the account's [`RateGate`] is taken; the call waits its turn.
+    Queued,
+    /// The provider rate-limited the account; calls wait until this time (Unix milliseconds).
+    RateLimited { until: u64 },
+}
+
 /// What a model call reports while it runs.
 pub enum Progress<'a> {
     /// Assistant text as it streams.
     Text(&'a str),
-    /// The provider rate-limited the call, which waits until this time (Unix milliseconds)
-    /// before trying again; `None` once it tries again.
-    RateLimited { until: Option<u64> },
+    /// The call is waiting, or with `None`, goes on after waiting.
+    Held(Option<Hold>),
 }
 
 pub trait Provider: Send + Sync {

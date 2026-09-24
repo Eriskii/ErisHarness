@@ -133,7 +133,7 @@ impl Provider for Responses {
         Box::pin(async move {
             let body = self.body(&request);
             let mut backoff = Duration::from_millis(250);
-            let report = |until| progress(Progress::RateLimited { until });
+            let report = |hold| progress(Progress::Held(hold));
             for attempt in 0..=self.config.max_retries {
                 let permit = self.config.gate.acquire(&report).await;
                 let (error, wait) = match self.attempt(&body, progress).await {

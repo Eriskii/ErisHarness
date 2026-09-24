@@ -21,6 +21,7 @@ pub struct HarnessBuilder {
     host: Option<Host>,
     dir: PathBuf,
     transcripts: Option<PathBuf>,
+    sandbox_dir: Option<PathBuf>,
     providers: HashMap<String, Arc<dyn Provider>>,
     tools: HashMap<String, Arc<dyn Tool>>,
     recipients: HashMap<String, Arc<dyn Recipient>>,
@@ -46,6 +47,12 @@ impl HarnessBuilder {
     /// `<dir>/transcripts`. Bind this into sandboxes to let agents read each other.
     pub fn transcripts(mut self, dir: impl Into<PathBuf>) -> Self {
         self.transcripts = Some(dir.into());
+        self
+    }
+
+    /// Where sandboxes keep their filesystems. Defaults to `<dir>/sandboxes`.
+    pub fn sandbox_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.sandbox_dir = Some(dir.into());
         self
     }
 
@@ -86,7 +93,10 @@ impl HarnessBuilder {
         let transcripts = self.transcripts.unwrap_or_else(|| self.dir.join("transcripts"));
         let store = Store::open(&self.dir.join("harness.db"), &transcripts)?;
         let sandboxes = match &self.host {
-            Some(host) => Some(Sandboxes::new(host, self.dir.join("sandboxes"))?.idle_grace(self.idle_grace)),
+            Some(host) => Some(
+                Sandboxes::new(host, self.sandbox_dir.unwrap_or_else(|| self.dir.join("sandboxes")))?
+                    .idle_grace(self.idle_grace),
+            ),
             None => None,
         };
         let (observations, _) = broadcast::channel(4096);
@@ -184,6 +194,7 @@ impl Harness {
             host: None,
             dir: dir.as_ref().to_owned(),
             transcripts: None,
+            sandbox_dir: None,
             providers: HashMap::new(),
             tools: HashMap::new(),
             recipients: HashMap::new(),
@@ -239,6 +250,11 @@ impl Harness {
 
     pub fn agent(&self, id: &str) -> Result<AgentRecord> {
         self.store.agent(id)?.with_context(|| format!("No agent {id}"))
+    }
+
+    /// Every agent, oldest first.
+    pub fn agents(&self) -> Result<Vec<AgentRecord>> {
+        self.store.agents()
     }
 
     pub fn transcript(&self, id: &str) -> Result<Vec<Entry>> {

@@ -20,6 +20,7 @@ fn spec(cwd: &Path, provider: &str) -> AgentSpec {
         model: "test-model".into(),
         reasoning_effort: None,
         context_window: None,
+        metadata: serde_json::Value::Null,
         machine: MachineSpec::Direct(DirectSpec { cwd: cwd.to_str().unwrap().into(), env: None }),
     }
 }

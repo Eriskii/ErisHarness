@@ -38,7 +38,8 @@ inbox (SQLite)  ──wake──▶  turn task  ──▶ provider ──▶ ite
 - **Agents** are rows in `harness.db` plus `transcripts/<id>/transcript.jsonl`. The
   transcript is the whole context. Only finished items are written; streaming text goes to
   observers only. Each agent's spec names its provider, model, reasoning effort, tools,
-  prompt and machine; `update_agent` changes it for the next turn, and `remove_agent` stops
+  prompt and machine, plus `metadata` the host keeps with it and the harness never reads.
+  `agents()` lists them; `update_agent` changes it for the next turn, and `remove_agent` stops
   the agent and deletes everything it had.
 - **Mail** is the only way to make an agent act. `Harness::send` from `"user"` or another
   agent's id queues a message. An idle agent starts a turn. A busy agent receives it at its
@@ -81,7 +82,8 @@ permissions. Children are reaped through pidfds, so running commands cost no thr
 
 Sandboxed agents run in [ErisSandbox](https://github.com/Eriskii/ErisSandbox) sandboxes. Enable
 them with `HarnessBuilder::sandboxes(&host)`, where `host` comes from `erissandbox::bootstrap()`,
-the first call in `main`. Each agent's sandbox has the agent's id. It is live only while the
+the first call in `main`. Each agent's sandbox has the agent's id, and its filesystem lives
+under `HarnessBuilder::sandbox_dir` (by default `<dir>/sandboxes`). It is live only while the
 agent runs commands and hibernates after the harness's `idle_grace`. The harness implements
 `Machine` for `erissandbox::Sandbox`.
 

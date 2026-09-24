@@ -49,6 +49,31 @@ CREATE TABLE IF NOT EXISTS inbox (
 CREATE INDEX IF NOT EXISTS inbox_pending ON inbox(agent) WHERE delivered_seq IS NULL;
 ";
 
+const COLUMNS: &str =
+    "id, spec, state, error, held, input_tokens, cached_tokens, output_tokens, reasoning_tokens, context_tokens";
+
+fn record(row: &rusqlite::Row) -> rusqlite::Result<Result<AgentRecord>> {
+    let spec: String = row.get(1)?;
+    let state: String = row.get(2)?;
+    let usage = Usage {
+        input: row.get::<_, i64>(5)? as u64,
+        cached_input: row.get::<_, i64>(6)? as u64,
+        output: row.get::<_, i64>(7)? as u64,
+        reasoning: row.get::<_, i64>(8)? as u64,
+    };
+    let (id, error, held, context_tokens) =
+        (row.get::<_, String>(0)?, row.get(3)?, row.get(4)?, row.get::<_, i64>(9)? as u64);
+    Ok(serde_json::from_str(&spec).map_err(Into::into).map(|spec| AgentRecord {
+        id,
+        spec,
+        state: AgentState::parse(&state),
+        error,
+        held,
+        usage,
+        context_tokens,
+    }))
+}
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
@@ -77,39 +102,14 @@ impl Store {
 
     pub fn agent(&self, id: &str) -> Result<Option<AgentRecord>> {
         let db = self.db.lock().unwrap();
-        db.query_row(
-            "SELECT spec, state, error, held, input_tokens, cached_tokens, output_tokens, reasoning_tokens, context_tokens
-             FROM agents WHERE id = ?1",
-            [id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, bool>(3)?,
-                    Usage {
-                        input: row.get::<_, i64>(4)? as u64,
-                        cached_input: row.get::<_, i64>(5)? as u64,
-                        output: row.get::<_, i64>(6)? as u64,
-                        reasoning: row.get::<_, i64>(7)? as u64,
-                    },
-                    row.get::<_, i64>(8)? as u64,
-                ))
-            },
-        )
-        .optional()?
-        .map(|(spec, state, error, held, usage, context_tokens)| {
-            Ok(AgentRecord {
-                id: id.to_owned(),
-                spec: serde_json::from_str(&spec)?,
-                state: AgentState::parse(&state),
-                error,
-                held,
-                usage,
-                context_tokens,
-            })
-        })
-        .transpose()
+        let mut statement = db.prepare_cached(&format!("SELECT {COLUMNS} FROM agents WHERE id = ?1"))?;
+        statement.query_row([id], record).optional()?.transpose()
+    }
+
+    pub fn agents(&self) -> Result<Vec<AgentRecord>> {
+        let db = self.db.lock().unwrap();
+        let mut statement = db.prepare_cached(&format!("SELECT {COLUMNS} FROM agents ORDER BY created_at, id"))?;
+        statement.query_map([], record)?.map(|row| row?).collect()
     }
 
     pub fn set_state(&self, id: &str, state: AgentState, error: Option<&str>) -> Result<()> {

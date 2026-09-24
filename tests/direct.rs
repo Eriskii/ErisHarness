@@ -26,6 +26,7 @@ fn direct(cwd: &Path) -> AgentSpec {
         model: "test-model".into(),
         reasoning_effort: Some("low".into()),
         context_window: None,
+        metadata: serde_json::Value::Null,
         machine: MachineSpec::Direct(DirectSpec { cwd: cwd.to_str().unwrap().into(), env: None }),
     }
 }

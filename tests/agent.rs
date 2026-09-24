@@ -43,6 +43,7 @@ fn spec(f: &Fixture) -> AgentSpec {
         model: "test-model".into(),
         reasoning_effort: Some("low".into()),
         context_window: None,
+        metadata: serde_json::Value::Null,
         machine: MachineSpec::Sandbox(f.spec()),
     }
 }
@@ -54,7 +55,9 @@ fn harness(f: &Fixture, dir: &std::path::Path, model: &Model) -> Arc<Harness> {
 fn harness_with(f: &Fixture, dir: &std::path::Path, models: &[(&str, &Model)]) -> Arc<Harness> {
     let builder = models
         .iter()
-        .fold(Harness::builder(dir).sandboxes(&f.host), |b, (name, model)| b.provider(name, model.provider()));
+        .fold(Harness::builder(dir).sandboxes(&f.host).sandbox_dir(dir.join("elsewhere")), |b, (name, model)| {
+            b.provider(name, model.provider())
+        });
     block_on(builder.tools(tools::builtin()).idle_grace(Duration::from_millis(500)).open()).expect("open harness")
 }
 
@@ -78,6 +81,7 @@ fn a_turn_runs_tools_until_the_model_answers(f: &Fixture) -> Result<(), Failed> 
     let agent = h.create_agent(spec(f)).unwrap();
     h.send(&agent, "user", "Run echo hi").unwrap();
     wait_for(&h, &agent, AgentState::Idle)?;
+    check(dir.join("elsewhere").join(&agent).exists() && !dir.join("sandboxes").exists(), "sandbox directory")?;
     let items = items(&h, &agent);
     check(
         matches!(&items[..], [

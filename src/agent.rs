@@ -17,6 +17,9 @@ pub struct AgentSpec {
     /// The model's context size in tokens. When a request would start above 80% of it, the
     /// transcript so far is compacted into a summary first.
     pub context_window: Option<u64>,
+    /// Whatever the host keeps with the agent, such as its name. The harness never reads it.
+    #[serde(default)]
+    pub metadata: serde_json::Value,
     pub machine: MachineSpec,
 }
 

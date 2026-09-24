@@ -105,7 +105,7 @@ fn main() -> anyhow::Result<()> {
             .idle_grace(Duration::from_secs(600))
             .open()
             .await?;
-        let agent_spec = AgentSpec { system_prompt: "bench".into(), tools: vec!["bash".into()], provider: "stub".into(), model: "stub".into(), reasoning_effort: None, context_window: None, machine: MachineSpec::Sandbox(spec.clone()) };
+        let agent_spec = AgentSpec { system_prompt: "bench".into(), tools: vec!["bash".into()], provider: "stub".into(), model: "stub".into(), reasoning_effort: None, context_window: None, metadata: serde_json::Value::Null, machine: MachineSpec::Sandbox(spec.clone()) };
 
         let before = self_rss();
         let started = Instant::now();

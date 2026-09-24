@@ -22,6 +22,7 @@ fn spec(cwd: &Path) -> AgentSpec {
         model: "model-one".into(),
         reasoning_effort: Some("high".into()),
         context_window: None,
+        metadata: json!({"name": "worker", "type": "default"}),
         machine: MachineSpec::Direct(DirectSpec { cwd: cwd.to_str().unwrap().into(), env: None }),
     }
 }
@@ -162,4 +163,20 @@ fn removing_an_agent_stops_it_and_deletes_its_state() {
     assert!(h.send(&agent, "user", "hello").is_err());
     let others = h.create_agent(spec(temp.path())).unwrap();
     assert!(h.agent(&others).is_ok());
+}
+
+#[test]
+fn agents_are_listed_with_the_metadata_their_host_gave_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let model = Model::start(vec![]);
+    let h = harness(&temp.path().join("state"), &model);
+    let first = h.create_agent(spec(temp.path())).unwrap();
+    let second = h
+        .create_agent(AgentSpec { metadata: json!({"name": "reviewer", "parent": first}), ..spec(temp.path()) })
+        .unwrap();
+    let agents = h.agents().unwrap();
+    assert_eq!(agents.iter().map(|a| a.id.clone()).collect::<Vec<_>>(), [first.clone(), second.clone()]);
+    assert_eq!(agents[1].spec.metadata, json!({"name": "reviewer", "parent": first}));
+    h.update_agent(&second, |spec| spec.metadata["name"] = json!("renamed")).unwrap();
+    assert_eq!(h.agent(&second).unwrap().spec.metadata["name"], "renamed");
 }

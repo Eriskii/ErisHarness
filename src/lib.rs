@@ -5,6 +5,7 @@ pub mod agent;
 mod bootstrap;
 mod cgroup;
 mod harness;
+pub mod machine;
 pub mod provider;
 pub mod rootfs;
 pub mod sandbox;

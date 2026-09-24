@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod model;
+
 use erisharness::Host;
 use erisharness::sandbox::{Limits, Output, Sandbox, SandboxSpec, Sandboxes};
 use std::path::{Path, PathBuf};

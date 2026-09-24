@@ -3,7 +3,7 @@
 //! to Docker's default capabilities under a seccomp filter, and serves requests until the
 //! harness closes the socket or asks it to stop. It is single-threaded and blocking.
 
-use super::proto::{self, BindMount, OpenMode, Reply, Request, Setup};
+use super::proto::{self, BindMount, Reply, Request, Setup};
 use super::seccomp;
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ use std::fs;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, symlink};
+use std::os::unix::fs::{DirBuilderExt, symlink};
 use std::path::{Path, PathBuf};
 
 /// Descriptor the harness installs for the control socket before exec.
@@ -348,7 +348,7 @@ impl<'a> Init<'a> {
                     }
                 }
             }
-            Request::Open { id, path, mode } => match open(&path, mode) {
+            Request::Open { id, path, mode } => match crate::machine::open_path(&path, mode) {
                 Ok(file) => self.reply(&Reply::Opened { id }, &[file.as_raw_fd()])?,
                 Err(error) => {
                     self.reply(&Reply::OpenFailed { id, errno: error.raw_os_error().unwrap_or(libc::EIO) }, &[])?
@@ -393,33 +393,6 @@ fn only_init_remains() -> bool {
             entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()).is_some_and(|pid| pid != 1)
         })
     })
-}
-
-fn open(path: &str, mode: OpenMode) -> io::Result<fs::File> {
-    let mut options = fs::OpenOptions::new();
-    // Non-blocking so a FIFO cannot stall init; the flag is cleared before handing it over.
-    options.custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK);
-    match mode {
-        OpenMode::Read => {
-            options.read(true);
-        }
-        OpenMode::Write { create_parents } => {
-            if create_parents && let Some(parent) = Path::new(path).parent() {
-                fs::create_dir_all(parent)?;
-            }
-            options.write(true).create(true).truncate(true).mode(0o644);
-        }
-        OpenMode::Update => {
-            options.read(true).write(true);
-        }
-    }
-    let file = options.open(path)?;
-    // SAFETY: F_GETFL/F_SETFL on a descriptor we own.
-    unsafe {
-        let flags = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
-        libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
-    }
-    Ok(file)
 }
 
 fn find_program(program: &str, env: &[(String, String)]) -> Option<CString> {

@@ -1,7 +1,7 @@
 //! What an agent is: a spec, a state, and a transcript of items. The transcript is the
 //! agent's entire context; everything else can be rebuilt from it.
 
-use crate::sandbox::SandboxSpec;
+use crate::machine::MachineSpec;
 use crate::tools::ToolOutput;
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +12,7 @@ pub struct AgentSpec {
     pub tools: Vec<String>,
     /// Name of a registered provider.
     pub provider: String,
-    pub sandbox: SandboxSpec,
+    pub machine: MachineSpec,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

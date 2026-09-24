@@ -3,7 +3,7 @@
 
 use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size, truncate_head};
 use super::{Content, Tool, ToolContext, ToolOutput, errors, js_number, resolve, string_arg};
-use crate::sandbox::OpenMode;
+use crate::machine::OpenMode;
 use base64::Engine;
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
@@ -61,10 +61,9 @@ async fn read(context: &ToolContext, args: &Value) -> Result<ToolOutput, String>
     let path = string_arg(args, "path")?;
     let offset = args.get("offset").and_then(Value::as_f64);
     let limit = args.get("limit").and_then(Value::as_f64);
-    let spec = context.sandbox.spec();
-    let absolute = resolve(path, &spec.cwd, spec.home());
-    let fd =
-        context.sandbox.open(&absolute, OpenMode::Read).await.map_err(|e| errors::node(&e, "access", &absolute))?;
+    let machine = &context.machine;
+    let absolute = resolve(path, machine.cwd(), machine.home());
+    let fd = machine.open(&absolute, OpenMode::Read).await.map_err(|e| errors::node(&e, "access", &absolute))?;
     let file = tokio::fs::File::from_std(std::fs::File::from(fd));
     let metadata = file.metadata().await.map_err(|e| errors::node(&e, "read", ""))?;
     if metadata.is_dir() {

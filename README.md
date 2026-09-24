@@ -3,9 +3,17 @@
 A Rust agent harness for running thousands of agents on one Linux machine. An agent is its
 transcript on disk. A live agent costs under a megabyte; an idle one costs a database row.
 
-Each agent works in its own sandbox: a private copy-on-write filesystem, process tree,
-loopback network, hostname and cgroup. Inside it the agent is root and can install packages
-and run any program; nothing of the host is visible except kernel and hardware facts.
+Each agent runs on a machine chosen per agent:
+
+- **Sandbox**: a private copy-on-write filesystem, process tree, loopback network, hostname
+  and cgroup. Inside it the agent is root and can install packages and run any program;
+  nothing of the host is visible except kernel and hardware facts.
+- **Direct**: this machine, as this user, in a working directory, with the harness's
+  environment or one given. No isolation and no setup: a harness with only direct agents
+  needs no `bootstrap`, subordinate ids or cgroups.
+
+Tools see only the `Machine` trait, and the tool tests run on both machines, so what the
+model sees is identical either way.
 
 ## Measured
 
@@ -24,7 +32,7 @@ Costs are flat from 1,000 to 3,000 live sandboxes and 500 to 2,000 concurrent tu
 ```
 inbox (SQLite)  ──wake──▶  turn task  ──▶ provider ──▶ items ──▶ transcript.jsonl
      ▲                         │
-     └── send_message ◀────────┴── tools ──▶ sandbox init (per agent, while live)
+     └── send_message ◀────────┴── tools ──▶ machine: sandbox init (while live) or direct
 ```
 
 - **Agents** are rows in `harness.db` plus `transcripts/<id>/transcript.jsonl`. The
@@ -45,9 +53,17 @@ inbox (SQLite)  ──wake──▶  turn task  ──▶ provider ──▶ ite
 - **Tools** implement `Tool`. `tools::builtin()` is Pi 0.87's `read`, `bash`, `edit`, `write`,
   with Pi's exact model-facing text, plus `send_message`.
 
+## Direct machines
+
+`MachineSpec::Direct(DirectSpec { cwd, env })` runs each command as `bash -c` (found through
+`PATH`) in `cwd`, in its own process group so an interrupt kills pipelines and children.
+`env: None` inherits the harness's environment. Files open with the harness user's
+permissions. Children are reaped through pidfds, so running commands cost no threads.
+
 ## Sandboxes
 
-`bootstrap()` must be the first call in `main`. It moves the process into a delegated cgroup
+Enable them with `HarnessBuilder::sandboxes(&host)`, where `host` comes from `bootstrap()`,
+which must be the first call in `main`. It moves the process into a delegated cgroup
 subtree and re-enters it inside a user namespace backed by the user's `/etc/subuid` range
 (`newuidmap`), so the harness needs no root. The same binary becomes a sandbox init when
 re-executed.

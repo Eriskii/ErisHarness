@@ -9,10 +9,12 @@ mod proto;
 mod seccomp;
 
 pub use crate::cgroup::Limits;
-pub use proto::OpenMode;
+pub use crate::machine::{DRAIN_GRACE, ExitStatus, Killer, OpenMode, Output, Process};
 
 use crate::Host;
+use crate::machine::{self, Machine};
 use anyhow::{Context, Result, bail};
+use futures_util::future::BoxFuture;
 use proto::{BindMount, LayerMount, Reply, Request, Setup};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -22,7 +24,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::oneshot;
 
@@ -73,36 +74,6 @@ pub struct Bind {
     pub writable: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ExitStatus {
-    pub code: Option<i32>,
-    pub signal: Option<i32>,
-}
-
-impl ExitStatus {
-    /// The shell convention: the exit code, or 128 plus the terminating signal.
-    pub fn code(&self) -> i32 {
-        self.code.unwrap_or_else(|| 128 + self.signal.unwrap_or(0))
-    }
-
-    pub fn success(&self) -> bool {
-        self.code == Some(0)
-    }
-}
-
-/// Combined stdout and stderr of a finished command.
-#[derive(Clone, Debug)]
-pub struct Output {
-    pub bytes: Vec<u8>,
-    pub status: ExitStatus,
-}
-
-impl Output {
-    pub fn text(&self) -> String {
-        String::from_utf8_lossy(&self.bytes).into_owned()
-    }
-}
-
 /// Owns every sandbox under one state directory.
 pub struct Sandboxes {
     host: Host,
@@ -149,7 +120,8 @@ impl Sandboxes {
                 bail!("sandbox {id} is live with a different spec");
             }
         }
-        let sandbox = Arc::new(Sandbox {
+        let sandbox = Arc::new_cyclic(|this| Sandbox {
+            this: this.clone(),
             id: id.to_owned(),
             dir: self.dir.join(id),
             cgroup: self.host.cgroups.agents().join(id),
@@ -193,6 +165,7 @@ fn valid_id(id: &str) -> bool {
 }
 
 pub struct Sandbox {
+    this: Weak<Sandbox>,
     id: String,
     dir: PathBuf,
     cgroup: PathBuf,
@@ -224,7 +197,7 @@ impl Sandbox {
 
     /// Starts `argv` in the working directory (the spec's unless given). Its combined output
     /// must be read, or the command blocks once the pipe fills.
-    pub async fn spawn(self: &Arc<Self>, argv: &[String], cwd: Option<&str>) -> Result<Process> {
+    pub async fn spawn(&self, argv: &[String], cwd: Option<&str>) -> Result<Process> {
         let (live, activity) = self.live().await?;
         let (output, input) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
         let id = live.next_id();
@@ -241,20 +214,22 @@ impl Sandbox {
             (other, _) => bail!("unexpected reply {other:?}"),
         }
         drop(input);
-        launch::set_nonblocking(&output)?;
-        let output = tokio::net::unix::pipe::Receiver::from_owned_fd(output)?;
-        Ok(Process { id, live, output: Some(output), exit, _activity: activity })
+        let killer = Killer::new(move || {
+            let live = live.clone();
+            Box::pin(async move {
+                let _ = live.send(&Request::Kill { id }, &[]).await;
+            })
+        });
+        Ok(Process::new(output, exit, killer, Some(Box::new(activity)))?)
     }
 
     /// Runs `argv` to completion and collects its output.
-    pub async fn run(self: &Arc<Self>, argv: &[String]) -> Result<Output> {
-        let mut bytes = Vec::new();
-        let status = self.spawn(argv, None).await?.drain(|chunk| bytes.extend_from_slice(chunk)).await;
-        Ok(Output { bytes, status })
+    pub async fn run(&self, argv: &[String]) -> Result<Output> {
+        machine::run(self, argv).await
     }
 
     /// Opens an absolute path as the sandbox sees it, with the sandbox's permissions.
-    pub async fn open(self: &Arc<Self>, path: &str, mode: OpenMode) -> io::Result<OwnedFd> {
+    pub async fn open(&self, path: &str, mode: OpenMode) -> io::Result<OwnedFd> {
         let (live, _activity) = self.live().await.map_err(io::Error::other)?;
         let id = live.next_id();
         let request = Request::Open { id, path: path.to_owned(), mode };
@@ -299,7 +274,8 @@ impl Sandbox {
 
     /// The running init, started if needed. The activity is taken under the lock so an idle
     /// shutdown cannot slip in between.
-    async fn live(self: &Arc<Self>) -> Result<(Arc<Live>, Activity)> {
+    async fn live(&self) -> Result<(Arc<Live>, Activity)> {
+        let this = self.this.upgrade().context("sandbox dropped")?;
         let mut guard = self.live.lock().await;
         if let Some(live) = guard.as_ref().filter(|live| !live.dead()) {
             return Ok((live.clone(), live.activity()));
@@ -308,10 +284,10 @@ impl Sandbox {
             stale.exited().await;
             self.tear_down(&mut guard);
         }
-        let live = self.start().await.with_context(|| format!("starting sandbox {}", self.id))?;
+        let live = this.start().await.with_context(|| format!("starting sandbox {}", self.id))?;
         *guard = Some(live.clone());
         self.live_flag.store(true, Ordering::Release);
-        self.registry.lock().unwrap().insert(self.id.clone(), self.clone());
+        self.registry.lock().unwrap().insert(self.id.clone(), this);
         Ok((live.clone(), live.activity()))
     }
 
@@ -380,84 +356,6 @@ impl Sandbox {
         });
     }
 }
-
-/// A running command. Dropping it leaves the command running.
-pub struct Process {
-    id: u64,
-    live: Arc<Live>,
-    output: Option<tokio::net::unix::pipe::Receiver>,
-    exit: oneshot::Receiver<ExitStatus>,
-    _activity: Activity,
-}
-
-impl Process {
-    /// Combined stdout and stderr. Reaches end of file once every process holding it exits.
-    pub fn take_output(&mut self) -> tokio::net::unix::pipe::Receiver {
-        self.output.take().expect("output already taken")
-    }
-
-    /// Kills the command's process group.
-    pub async fn kill(&self) {
-        self.killer().kill().await;
-    }
-
-    /// A handle that kills this command, usable while [`Process::wait`] owns the process.
-    pub fn killer(&self) -> Killer {
-        Killer { id: self.id, live: self.live.clone() }
-    }
-
-    pub async fn wait(self) -> ExitStatus {
-        self.exit.await.unwrap_or(KILLED)
-    }
-
-    /// Feeds output to `sink` until the command exits, then for at most [`DRAIN_GRACE`]
-    /// longer. Background processes it started may keep the pipe open indefinitely; they
-    /// are not waited for.
-    pub async fn drain(mut self, mut sink: impl FnMut(&[u8])) -> ExitStatus {
-        let mut output = self.take_output();
-        let mut buffer = vec![0u8; 16 * 1024];
-        let mut status = None;
-        let mut deadline = None;
-        loop {
-            let read = async {
-                match deadline {
-                    Some(at) => tokio::time::timeout_at(at, output.read(&mut buffer)).await.ok(),
-                    None => Some(output.read(&mut buffer).await),
-                }
-            };
-            tokio::select! {
-                exit = &mut self.exit, if status.is_none() => {
-                    status = Some(exit.unwrap_or(KILLED));
-                    deadline = Some(tokio::time::Instant::now() + DRAIN_GRACE);
-                }
-                result = read => match result {
-                    Some(Ok(n)) if n > 0 => sink(&buffer[..n]),
-                    Some(Ok(_)) | Some(Err(_)) if status.is_none() => {
-                        return (&mut self.exit).await.unwrap_or(KILLED);
-                    }
-                    _ => return status.unwrap_or(KILLED),
-                },
-            }
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct Killer {
-    id: u64,
-    live: Arc<Live>,
-}
-
-impl Killer {
-    pub async fn kill(&self) {
-        let _ = self.live.send(&Request::Kill { id: self.id }, &[]).await;
-    }
-}
-
-const KILLED: ExitStatus = ExitStatus { code: None, signal: Some(libc::SIGKILL) };
-
-/// How long output is still collected after a command exits.
-pub const DRAIN_GRACE: Duration = Duration::from_millis(100);
 
 type Pending = oneshot::Sender<(Reply, Vec<OwnedFd>)>;
 
@@ -587,11 +485,26 @@ impl Live {
         }
     }
 
-    /// Waits for init to exit and reaps it. Safe to repeat: a reaped pidfd stays readable.
+    /// Waits for init to exit and reaps it. Safe to repeat.
     async fn exited(&self) {
-        let _ = self.pidfd.readable().await;
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: reaping the init this pidfd refers to; it is readable once init has exited.
-        unsafe { libc::waitid(libc::P_PIDFD, self.pidfd.as_raw_fd() as libc::id_t, &mut info, libc::WEXITED) };
+        machine::reap(&self.pidfd).await;
+    }
+}
+
+impl Machine for Sandbox {
+    fn cwd(&self) -> &str {
+        &self.spec.cwd
+    }
+
+    fn home(&self) -> &str {
+        self.spec.home()
+    }
+
+    fn spawn<'a>(&'a self, argv: &'a [String], cwd: Option<&'a str>) -> BoxFuture<'a, Result<Process>> {
+        Box::pin(Sandbox::spawn(self, argv, cwd))
+    }
+
+    fn open<'a>(&'a self, path: &'a str, mode: OpenMode) -> BoxFuture<'a, io::Result<OwnedFd>> {
+        Box::pin(Sandbox::open(self, path, mode))
     }
 }

@@ -1,7 +1,7 @@
 //! Pi's `write` tool.
 
 use super::{Tool, ToolContext, ToolOutput, errors, resolve, string_arg};
-use crate::sandbox::OpenMode;
+use crate::machine::OpenMode;
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
@@ -49,10 +49,9 @@ impl Tool for Write {
 async fn write(context: &ToolContext, args: &Value) -> Result<ToolOutput, String> {
     let path = string_arg(args, "path")?;
     let content = string_arg(args, "content")?;
-    let spec = context.sandbox.spec();
-    let absolute = resolve(path, &spec.cwd, spec.home());
-    let fd = context
-        .sandbox
+    let machine = &context.machine;
+    let absolute = resolve(path, machine.cwd(), machine.home());
+    let fd = machine
         .open(&absolute, OpenMode::Write { create_parents: true })
         .await
         .map_err(|e| errors::node(&e, "open", &absolute))?;

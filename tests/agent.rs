@@ -2,17 +2,14 @@
 
 mod common;
 
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
-use common::{Fixture, block_on, runtime};
+use common::model::{Model, Reply, calls, completed, says};
+use common::{Fixture, block_on};
 use erisharness::agent::{AgentSpec, AgentState, Item, Observation};
-use erisharness::provider::{Responses, ResponsesConfig, StaticToken};
+use erisharness::machine::MachineSpec;
 use erisharness::{Harness, tools};
 use libtest_mimic::Failed;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 fn main() {
@@ -38,109 +35,12 @@ fn main() {
     ]);
 }
 
-/// One scripted reply: an HTTP status with headers, or an SSE stream of Responses events.
-#[derive(Clone)]
-enum Reply {
-    Status(u16, Vec<(&'static str, &'static str)>),
-    Events(Vec<Value>),
-    Delayed(Duration, Vec<Value>),
-}
-
-#[derive(Default)]
-struct Script {
-    replies: VecDeque<Reply>,
-    requests: Vec<Value>,
-    auth: Vec<String>,
-}
-
-type Shared = Arc<Mutex<Script>>;
-
-struct Model {
-    url: String,
-    script: Shared,
-}
-
-impl Model {
-    fn start(replies: Vec<Reply>) -> Self {
-        let script: Shared = Arc::new(Mutex::new(Script { replies: replies.into(), ..Script::default() }));
-        let app = axum::Router::new().route("/v1/responses", axum::routing::post(respond)).with_state(script.clone());
-        let listener = block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
-        let url = format!("http://{}/v1", listener.local_addr().unwrap());
-        runtime().spawn(async move { axum::serve(listener, app).await.unwrap() });
-        Self { url, script }
-    }
-
-    fn requests(&self) -> Vec<Value> {
-        self.script.lock().unwrap().requests.clone()
-    }
-
-    fn provider(&self) -> Arc<Responses> {
-        Arc::new(Responses::new(ResponsesConfig {
-            base_url: self.url.clone(),
-            model: "test-model".into(),
-            reasoning_effort: Some("low".into()),
-            headers: vec![("x-test".into(), "1".into())],
-            store: false,
-            max_retries: 3,
-            credentials: Arc::new(StaticToken("secret-token".into())),
-        }))
-    }
-}
-
-async fn respond(State(script): State<Shared>, headers: HeaderMap, body: String) -> Response {
-    let reply = {
-        let mut script = script.lock().unwrap();
-        script.requests.push(serde_json::from_str(&body).unwrap());
-        script.auth.push(headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned());
-        script.replies.pop_front()
-    };
-    let events = match reply {
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "script exhausted").into_response(),
-        Some(Reply::Status(code, headers)) => {
-            let mut response =
-                (StatusCode::from_u16(code).unwrap(), "{\"error\":{\"message\":\"scripted\"}}").into_response();
-            for (key, value) in headers {
-                response.headers_mut().insert(key, value.parse().unwrap());
-            }
-            return response;
-        }
-        Some(Reply::Events(events)) => events,
-        Some(Reply::Delayed(delay, events)) => {
-            tokio::time::sleep(delay).await;
-            events
-        }
-    };
-    let body: String =
-        events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect();
-    ([("content-type", "text/event-stream")], body).into_response()
-}
-
-fn completed() -> Value {
-    json!({"type": "response.completed", "response": {"usage": {"input_tokens": 10, "output_tokens": 5, "input_tokens_details": {"cached_tokens": 4}, "output_tokens_details": {"reasoning_tokens": 1}}}})
-}
-
-fn says(text: &str) -> Reply {
-    Reply::Events(vec![
-        json!({"type": "response.output_text.delta", "delta": &text[..text.len() / 2]}),
-        json!({"type": "response.output_text.delta", "delta": &text[text.len() / 2..]}),
-        json!({"type": "response.output_item.done", "item": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}}),
-        completed(),
-    ])
-}
-
-fn calls(call_id: &str, name: &str, args: Value) -> Reply {
-    Reply::Events(vec![
-        json!({"type": "response.output_item.done", "item": {"type": "function_call", "call_id": call_id, "name": name, "arguments": args.to_string()}}),
-        completed(),
-    ])
-}
-
 fn spec(f: &Fixture) -> AgentSpec {
     AgentSpec {
         system_prompt: "You are a test agent.".into(),
         tools: vec!["read".into(), "bash".into(), "edit".into(), "write".into(), "send_message".into()],
         provider: "test".into(),
-        sandbox: f.spec(),
+        machine: MachineSpec::Sandbox(f.spec()),
     }
 }
 
@@ -149,8 +49,9 @@ fn harness(f: &Fixture, dir: &std::path::Path, model: &Model) -> Arc<Harness> {
 }
 
 fn harness_with(f: &Fixture, dir: &std::path::Path, models: &[(&str, &Model)]) -> Arc<Harness> {
-    let builder =
-        models.iter().fold(Harness::builder(&f.host, dir), |b, (name, model)| b.provider(name, model.provider()));
+    let builder = models
+        .iter()
+        .fold(Harness::builder(dir).sandboxes(&f.host), |b, (name, model)| b.provider(name, model.provider()));
     block_on(builder.tools(tools::builtin()).idle_grace(Duration::from_millis(500)).open()).expect("open harness")
 }
 
@@ -346,7 +247,8 @@ fn transcripts_are_jsonl_readable_by_other_agents(f: &Fixture) -> Result<(), Fai
     let lines: Vec<Value> = std::fs::read_to_string(&path)?.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     check(lines.len() == 2 && lines[0]["seq"] == 0 && lines[1]["type"] == "assistant", format!("{lines:?}"))?;
     let mut reader_spec = spec(f);
-    reader_spec.sandbox.binds.push(erisharness::sandbox::Bind {
+    let MachineSpec::Sandbox(sandbox) = &mut reader_spec.machine else { unreachable!() };
+    sandbox.binds.push(erisharness::sandbox::Bind {
         source: path.parent().unwrap().parent().unwrap().to_path_buf(),
         target: "/records".into(),
         writable: false,

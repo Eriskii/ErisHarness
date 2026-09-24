@@ -3,7 +3,7 @@
 
 use super::text::{self, Edit as Replacement};
 use super::{Tool, ToolContext, ToolOutput, errors, resolve};
-use crate::sandbox::OpenMode;
+use crate::machine::OpenMode;
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use std::io::SeekFrom;
@@ -92,10 +92,9 @@ fn replacements(args: &Value) -> Result<Vec<Replacement>, String> {
 async fn edit(context: &ToolContext, args: Value) -> Result<ToolOutput, String> {
     let edits = replacements(&args)?;
     let path = args.get("path").and_then(Value::as_str).ok_or("Edit tool input is invalid. path must be a string.")?;
-    let spec = context.sandbox.spec();
-    let absolute = resolve(path, &spec.cwd, spec.home());
-    let fd = context
-        .sandbox
+    let machine = &context.machine;
+    let absolute = resolve(path, machine.cwd(), machine.home());
+    let fd = machine
         .open(&absolute, OpenMode::Update)
         .await
         .map_err(|e| format!("Could not edit file: {path}. Error code: {}.", errors::code(&e)))?;

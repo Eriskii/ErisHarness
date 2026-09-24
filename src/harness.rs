@@ -4,6 +4,7 @@
 
 use crate::Host;
 use crate::agent::{AgentRecord, AgentSpec, AgentState, Entry, Item, Observation};
+use crate::machine::{Direct, Machine, MachineSpec};
 use crate::provider::{Provider, Request, ToolSpec};
 use crate::sandbox::Sandboxes;
 use crate::store::{Store, Transcript};
@@ -17,7 +18,7 @@ use tokio::sync::{Semaphore, broadcast};
 use tokio_util::sync::CancellationToken;
 
 pub struct HarnessBuilder {
-    host: Host,
+    host: Option<Host>,
     dir: PathBuf,
     transcripts: Option<PathBuf>,
     providers: HashMap<String, Arc<dyn Provider>>,
@@ -27,6 +28,13 @@ pub struct HarnessBuilder {
 }
 
 impl HarnessBuilder {
+    /// Enables sandboxed agents. Requires [`bootstrap`](crate::bootstrap) at the start of
+    /// `main`. Without it the harness runs only direct agents and needs no setup at all.
+    pub fn sandboxes(mut self, host: &Host) -> Self {
+        self.host = Some(host.clone());
+        self
+    }
+
     /// Where transcripts live, one `<agent>/transcript.jsonl` each. Defaults to
     /// `<dir>/transcripts`. Bind this into sandboxes to let agents read each other.
     pub fn transcripts(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -64,7 +72,10 @@ impl HarnessBuilder {
     pub async fn open(self) -> Result<Arc<Harness>> {
         let transcripts = self.transcripts.unwrap_or_else(|| self.dir.join("transcripts"));
         let store = Store::open(&self.dir.join("harness.db"), &transcripts)?;
-        let sandboxes = Sandboxes::new(&self.host, self.dir.join("sandboxes"))?.idle_grace(self.idle_grace);
+        let sandboxes = match &self.host {
+            Some(host) => Some(Sandboxes::new(host, self.dir.join("sandboxes"))?.idle_grace(self.idle_grace)),
+            None => None,
+        };
         let (observations, _) = broadcast::channel(4096);
         let harness = Arc::new_cyclic(|this| Harness {
             mailbox: Arc::new(Inboxes(this.clone())),
@@ -92,7 +103,7 @@ struct Run {
 
 pub struct Harness {
     store: Store,
-    sandboxes: Sandboxes,
+    sandboxes: Option<Sandboxes>,
     providers: HashMap<String, Arc<dyn Provider>>,
     tools: HashMap<String, Arc<dyn Tool>>,
     turns: Arc<Semaphore>,
@@ -124,9 +135,9 @@ const INTERRUPTED_CALL: &str = "Tool call was interrupted before it finished.";
 const SKIPPED_CALL: &str = "Tool call skipped: the turn was interrupted.";
 
 impl Harness {
-    pub fn builder(host: &Host, dir: impl AsRef<Path>) -> HarnessBuilder {
+    pub fn builder(dir: impl AsRef<Path>) -> HarnessBuilder {
         HarnessBuilder {
-            host: host.clone(),
+            host: None,
             dir: dir.as_ref().to_owned(),
             transcripts: None,
             providers: HashMap::new(),
@@ -142,6 +153,9 @@ impl Harness {
         }
         if let Some(missing) = spec.tools.iter().find(|t| !self.tools.contains_key(*t)) {
             bail!("unknown tool {missing}");
+        }
+        if matches!(spec.machine, MachineSpec::Sandbox(_)) && self.sandboxes.is_none() {
+            bail!("sandboxes are not enabled; open the harness with HarnessBuilder::sandboxes");
         }
         let id = uuid::Uuid::now_v7().simple().to_string();
         self.store.create_agent(&id, &spec)?;
@@ -166,7 +180,7 @@ impl Harness {
 
     /// Sandboxes currently running processes.
     pub fn live_sandboxes(&self) -> usize {
-        self.sandboxes.live_count()
+        self.sandboxes.as_ref().map_or(0, Sandboxes::live_count)
     }
 
     /// Queues a message for `agent` from `"user"` or another agent's id. A user message
@@ -215,7 +229,9 @@ impl Harness {
         for task in tasks {
             let _ = task.await;
         }
-        self.sandboxes.shutdown_all().await;
+        if let Some(sandboxes) = &self.sandboxes {
+            sandboxes.shutdown_all().await;
+        }
     }
 
     fn observe(&self, observation: Observation) {
@@ -280,7 +296,12 @@ impl Harness {
         let system = system_prompt(&spec.system_prompt, agent, &tools);
         let mut transcript = self.store.transcript(agent)?;
         self.close_dangling_calls(agent, &mut transcript)?;
-        let sandbox = self.sandboxes.sandbox(agent, spec.sandbox.clone())?;
+        let machine: Arc<dyn Machine> = match &spec.machine {
+            MachineSpec::Sandbox(sandbox) => {
+                self.sandboxes.as_ref().context("sandboxes are not enabled")?.sandbox(agent, sandbox.clone())?
+            }
+            MachineSpec::Direct(direct) => Arc::new(Direct::new(direct.clone())),
+        };
         let mut announced = record.state == AgentState::Running;
         loop {
             if cancel.is_cancelled() {
@@ -313,7 +334,7 @@ impl Harness {
             }
             let context = ToolContext {
                 agent: agent.to_owned(),
-                sandbox: sandbox.clone(),
+                machine: machine.clone(),
                 mailbox: self.mailbox.clone(),
                 cancel: cancel.child_token(),
             };

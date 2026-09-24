@@ -38,17 +38,7 @@ pub struct BindMount {
     pub writable: bool,
 }
 
-/// How [`Request::Open`] opens a path inside the sandbox.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OpenMode {
-    Read,
-    /// Create or truncate, optionally creating missing parent directories.
-    Write {
-        create_parents: bool,
-    },
-    /// Read and write an existing file without truncating it.
-    Update,
-}
+pub use crate::machine::OpenMode;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]

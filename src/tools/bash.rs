@@ -1,10 +1,10 @@
-//! Pi's `bash` tool. Each call is a fresh `bash -c` in the sandbox's working directory.
+//! Pi's `bash` tool. Each call is a fresh `bash -c` in the machine's working directory.
 //! Output memory is bounded: once output passes Pi's limits the full log streams to a file
-//! inside the sandbox and only a tail window stays in memory.
+//! on the machine and only a tail window stays in memory.
 
 use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, format_size, truncate_tail};
 use super::{Tool, ToolContext, ToolOutput, js_number, string_arg};
-use crate::sandbox::{DRAIN_GRACE, OpenMode, Sandbox};
+use crate::machine::{DRAIN_GRACE, Machine, OpenMode};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -71,9 +71,10 @@ async fn bash(context: &ToolContext, args: &Value) -> Result<ToolOutput, String>
         }
         Some(t) => Some(t),
     };
-    let sandbox = &context.sandbox;
-    let argv = ["/bin/bash".to_owned(), "-c".to_owned(), command.to_owned()];
-    let mut process = sandbox.spawn(&argv, None).await.map_err(|e| {
+    let machine = &context.machine;
+    // Found through PATH: not every host has /bin/bash (NixOS, for one).
+    let argv = ["bash".to_owned(), "-c".to_owned(), command.to_owned()];
+    let mut process = machine.spawn(&argv, None).await.map_err(|e| {
         let message = format!("{e:#}");
         if message.starts_with("Working directory does not exist") {
             format!("{message}\nCannot execute bash commands.")
@@ -92,7 +93,7 @@ async fn bash(context: &ToolContext, args: &Value) -> Result<ToolOutput, String>
         }
     };
     tokio::pin!(expired);
-    let mut collected = Collected::new(sandbox.clone());
+    let mut collected = Collected::new(machine.clone());
     let mut buffer = vec![0u8; 16 * 1024];
     let mut stopped = None;
     let mut open = true;
@@ -141,7 +142,7 @@ async fn bash(context: &ToolContext, args: &Value) -> Result<ToolOutput, String>
 
 /// Output of one command: everything while small, then a log file plus a tail window.
 struct Collected {
-    sandbox: Arc<Sandbox>,
+    machine: Arc<dyn Machine>,
     kept: Vec<u8>,
     trimmed: bool,
     log: Option<(String, tokio::fs::File)>,
@@ -173,9 +174,9 @@ impl Rendered {
 }
 
 impl Collected {
-    fn new(sandbox: Arc<Sandbox>) -> Self {
+    fn new(machine: Arc<dyn Machine>) -> Self {
         Self {
-            sandbox,
+            machine,
             kept: Vec::new(),
             trimmed: false,
             log: None,
@@ -219,7 +220,7 @@ impl Collected {
 
     async fn open_log(&mut self) {
         let path = format!("/tmp/bash-{}.log", uuid::Uuid::now_v7().simple());
-        if let Ok(fd) = self.sandbox.open(&path, OpenMode::Write { create_parents: true }).await {
+        if let Ok(fd) = self.machine.open(&path, OpenMode::Write { create_parents: true }).await {
             let mut file = tokio::fs::File::from_std(std::fs::File::from(fd));
             let _ = file.write_all(&self.kept).await;
             self.log = Some((path, file));

@@ -9,6 +9,7 @@
 //! bash command, so every turn starts a sandbox, runs a real process and answers.
 
 use erisharness::agent::{AgentSpec, AgentState, Item, Usage};
+use erisharness::machine::MachineSpec;
 use erisharness::provider::{Completion, Provider, Request};
 use erisharness::sandbox::{Limits, SandboxSpec, Sandboxes};
 use erisharness::{Harness, tools};
@@ -95,13 +96,14 @@ fn main() -> anyhow::Result<()> {
             cwd: "/root".into(),
             env: SandboxSpec::default_env(),
         };
-        let harness = Harness::builder(&host, dir.path())
+        let harness = Harness::builder(dir.path())
+            .sandboxes(&host)
             .provider("stub", Arc::new(Stub))
             .tools(tools::builtin())
             .idle_grace(Duration::from_secs(600))
             .open()
             .await?;
-        let agent_spec = AgentSpec { system_prompt: "bench".into(), tools: vec!["bash".into()], provider: "stub".into(), sandbox: spec.clone() };
+        let agent_spec = AgentSpec { system_prompt: "bench".into(), tools: vec!["bash".into()], provider: "stub".into(), machine: MachineSpec::Sandbox(spec.clone()) };
 
         let before = self_rss();
         let started = Instant::now();

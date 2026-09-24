@@ -1,5 +1,5 @@
 //! Tools an agent can call. Anything implementing [`Tool`] can be registered; [`builtin`]
-//! provides Pi's coding set (read, bash, edit, write) running inside the agent's sandbox,
+//! provides Pi's coding set (read, bash, edit, write) running on the agent's machine,
 //! plus `send_message` for mail between agents.
 
 mod bash;
@@ -13,7 +13,7 @@ mod write;
 
 pub use path::resolve;
 
-use crate::sandbox::Sandbox;
+use crate::machine::Machine;
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -65,7 +65,7 @@ pub trait Mailbox: Send + Sync {
 pub struct ToolContext {
     /// The calling agent's id.
     pub agent: String,
-    pub sandbox: Arc<Sandbox>,
+    pub machine: Arc<dyn Machine>,
     pub mailbox: Arc<dyn Mailbox>,
     /// Cancelled when the agent is interrupted; long-running tools should stop.
     pub cancel: CancellationToken,

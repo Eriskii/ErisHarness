@@ -68,7 +68,7 @@ pub fn init(exe: BorrowedFd, cgroup: BorrowedFd) -> Result<(OwnedFd, OwnedFd)> {
     // SAFETY: CLONE_PIDFD stored a descriptor we now own.
     let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
     drop(theirs);
-    set_nonblocking(&ours)?;
+    crate::machine::set_nonblocking(&ours)?;
     // One extent per extent of the harness map (root, then the subordinate range): the kernel
     // rejects an extent that spans two parent extents.
     let map = format!("0 0 1\n1 1 {}\n", ID_COUNT - 1);
@@ -88,18 +88,6 @@ pub fn init(exe: BorrowedFd, cgroup: BorrowedFd) -> Result<(OwnedFd, OwnedFd)> {
         return Err(error).context("mapping sandbox ids");
     }
     Ok((ours, pidfd))
-}
-
-/// Tokio drives these descriptors; a blocking read would stall a runtime worker.
-pub fn set_nonblocking(fd: &impl AsRawFd) -> io::Result<()> {
-    // SAFETY: F_GETFL/F_SETFL on a valid descriptor.
-    unsafe {
-        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
-        if flags < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
 }
 
 /// Runs in the cloned child. Never returns.

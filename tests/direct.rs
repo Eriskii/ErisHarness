@@ -1,60 +1,14 @@
-//! Direct mode: agents run on this machine as this user. No bootstrap, namespaces, cgroups
-//! or images are needed, so this binary uses the standard test harness.
+//! Direct agents run on this machine as this user. They need no bootstrap, namespaces,
+//! cgroups or images, so this binary uses the standard test harness.
 
 mod common;
 
-use common::block_on;
 use common::model::{Model, calls, says};
-use erisharness::agent::{AgentSpec, AgentState, Item};
-use erisharness::machine::{DirectSpec, MachineSpec};
-use erisharness::{Harness, tools};
-use erissandbox::{Limits, SandboxSpec};
+use common::{direct, harness, results, settle};
+use erisharness::agent::{AgentSpec, AgentState};
+use erisharness::machine::MachineSpec;
 use serde_json::json;
-use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
-
-fn harness(dir: &Path, model: &Model) -> Arc<Harness> {
-    block_on(Harness::builder(dir).provider("test", model.provider()).tools(tools::builtin()).open()).unwrap()
-}
-
-fn direct(cwd: &Path) -> AgentSpec {
-    AgentSpec {
-        system_prompt: "Direct agent.".into(),
-        tools: vec!["read".into(), "bash".into(), "edit".into(), "write".into(), "send_message".into()],
-        provider: "test".into(),
-        model: "test-model".into(),
-        reasoning_effort: Some("low".into()),
-        context_window: None,
-        metadata: serde_json::Value::Null,
-        machine: MachineSpec::Direct(DirectSpec { cwd: cwd.to_str().unwrap().into(), env: None }),
-    }
-}
-
-fn settle(h: &Harness, agent: &str) {
-    block_on(async { tokio::time::timeout(Duration::from_secs(20), h.wait_for(agent, AgentState::Idle)).await })
-        .expect("agent settled");
-}
-
-fn results(h: &Harness, agent: &str) -> Vec<String> {
-    h.transcript(agent)
-        .unwrap()
-        .into_iter()
-        .filter_map(|e| match e.item {
-            Item::ToolResult { output, .. } => Some(
-                output
-                    .content
-                    .iter()
-                    .map(|c| match c {
-                        tools::Content::Text(t) => t.clone(),
-                        tools::Content::Image { .. } => String::new(),
-                    })
-                    .collect(),
-            ),
-            _ => None,
-        })
-        .collect()
-}
 
 #[test]
 fn agents_work_on_the_host_filesystem_in_their_directory() {
@@ -71,11 +25,14 @@ fn agents_work_on_the_host_filesystem_in_their_directory() {
     let h = harness(&temp.path().join("state"), &model);
     let agent = h.create_agent(direct(&project)).unwrap();
     h.send(&agent, "user", "look around").unwrap();
-    settle(&h, &agent);
+    settle(&h, &agent, AgentState::Idle);
     let uid = nix::unistd::getuid();
     assert_eq!(
         results(&h, &agent),
-        [format!("{}\nhost file\n{uid}\n", project.display()), "Successfully wrote to made.txt".into()]
+        [
+            (false, format!("{}\nhost file\n{uid}\n", project.display())),
+            (false, "Successfully wrote to made.txt".into())
+        ]
     );
     assert_eq!(std::fs::read_to_string(project.join("made.txt")).unwrap(), "by agent");
 }
@@ -90,15 +47,15 @@ fn direct_agents_inherit_the_harness_environment_unless_given_one() {
     machine.env = Some(vec![("HOME".into(), "/elsewhere".into()), ("ERIS_MARKER".into(), "set".into())]);
     let agent = h.create_agent(spec).unwrap();
     h.send(&agent, "user", "env").unwrap();
-    settle(&h, &agent);
-    assert_eq!(results(&h, &agent), ["/elsewhere|set\n"]);
+    settle(&h, &agent, AgentState::Idle);
+    assert_eq!(results(&h, &agent), [(false, "/elsewhere|set\n".into())]);
 
     let inherited = Model::start(vec![calls("c1", "bash", json!({"command": "echo \"$HOME\""})), says("ok")]);
     let h = harness(&temp.path().join("state2"), &inherited);
     let agent = h.create_agent(direct(temp.path())).unwrap();
     h.send(&agent, "user", "env").unwrap();
-    settle(&h, &agent);
-    assert_eq!(results(&h, &agent), [format!("{}\n", std::env::var("HOME").unwrap())]);
+    settle(&h, &agent, AgentState::Idle);
+    assert_eq!(results(&h, &agent), [(false, format!("{}\n", std::env::var("HOME").unwrap()))]);
 }
 
 #[test]
@@ -111,8 +68,8 @@ fn interrupting_kills_the_commands_process_group() {
     h.send(&agent, "user", "sleep").unwrap();
     std::thread::sleep(Duration::from_millis(800));
     h.interrupt(&agent);
-    settle(&h, &agent);
-    assert_eq!(results(&h, &agent), ["Command aborted"]);
+    settle(&h, &agent, AgentState::Idle);
+    assert_eq!(results(&h, &agent), [(true, "Command aborted".into())]);
     std::thread::sleep(Duration::from_millis(200));
     let survivors = std::fs::read_dir("/proc")
         .unwrap()
@@ -126,22 +83,9 @@ fn interrupting_kills_the_commands_process_group() {
 #[test]
 fn sandboxed_agents_need_sandboxes_enabled() {
     let temp = tempfile::tempdir().unwrap();
-    let model = Model::start(vec![]);
-    let h = harness(&temp.path().join("state"), &model);
-    let spec = AgentSpec {
-        machine: MachineSpec::Sandbox(SandboxSpec {
-            rootfs: "/nonexistent".into(),
-            layers: Vec::new(),
-            binds: Vec::new(),
-            limits: Limits::default(),
-            hostname: String::new(),
-            cwd: "/root".into(),
-            env: SandboxSpec::default_env(),
-            devices: Vec::new(),
-            forwards: Vec::new(),
-        }),
-        ..direct(temp.path())
-    };
+    let h = harness(&temp.path().join("state"), &Model::start(vec![]));
+    let spec =
+        AgentSpec { machine: MachineSpec::Sandbox(common::sandbox_spec("/nonexistent".into())), ..direct(temp.path()) };
     let error = h.create_agent(spec).unwrap_err().to_string();
     assert!(error.contains("sandboxes are not enabled"), "{error}");
 }

@@ -1,4 +1,7 @@
-//! Protocol tests use a real local HTTP server; no account, subscription or Docker needed.
+//! The Anthropic provider against a local HTTP server; no account, subscription or Docker needed.
+
+mod common;
+
 use axum::{
     Router,
     extract::State,
@@ -9,8 +12,7 @@ use axum::{
 use erisharness::provider::anthropic::fingerprint::{self, DEFAULT_VERSION, IDENTITY};
 use erisharness::{
     Harness,
-    agent::{AgentSpec, AgentState, Item, Observation},
-    machine::{DirectSpec, MachineSpec},
+    agent::{AgentRecord, AgentSpec, AgentState, Item, Observation, Usage},
     provider::{
         Anthropic, AnthropicAuth, AnthropicConfig, ClaudeCode, Progress, Provider, ProviderEvent, Request, StaticToken,
         Thinking, ToolSpec,
@@ -116,6 +118,31 @@ fn streamed_events(blocks: Vec<Value>, stop: &str, deltas: &[(usize, &str)]) -> 
 fn says() -> Reply {
     events(vec![json!({"type":"text","text":"done"})], "end_turn")
 }
+fn agent(dir: &std::path::Path, tools: &[&str]) -> AgentSpec {
+    AgentSpec {
+        tools: tools.iter().map(|t| t.to_string()).collect(),
+        provider: "claude".into(),
+        model: "claude-test".into(),
+        ..common::direct(dir)
+    }
+}
+/// Sends the user's `text` and waits for the turn to end, idle or failed.
+async fn turn(harness: &Arc<Harness>, id: &str, text: &str) -> AgentRecord {
+    let mut observations = harness.subscribe();
+    harness.send(id, "user", text).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Observation::State { state: AgentState::Idle | AgentState::Failed, .. } =
+                observations.recv().await.unwrap()
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    harness.agent(id).unwrap()
+}
 fn request<'a>(items: &'a [Item], tools: &'a [ToolSpec]) -> Request<'a> {
     Request {
         model: "claude-test",
@@ -153,9 +180,8 @@ async fn oauth_wire_checksum_headers_cache_and_tool_names() {
         )
         .await
         .unwrap();
-    assert_eq!(result.usage.input, 60);
-    assert_eq!(result.usage.cached_input, 20);
-    assert_eq!(result.usage.output, 7);
+    // Input counts every prompt token: fresh, read from the cache, and written to it.
+    assert_eq!(result.usage, Usage { input: 60, cached_input: 20, cache_write: 30, output: 7, reasoning: 0 });
     let script = server.script.lock().unwrap();
     let (headers, raw, uri) = &script.requests[0];
     assert_eq!(uri, "/v1/messages?beta=true");
@@ -224,33 +250,12 @@ async fn signed_thinking_and_tools_round_trip_through_the_harness() {
         .open()
         .await
         .unwrap();
-    let mut observations = harness.subscribe();
     let id = harness
-        .create_agent(AgentSpec {
-            system_prompt: "Review".into(),
-            tools: vec!["read".into()],
-            provider: "claude".into(),
-            model: "claude-test".into(),
-            reasoning_effort: Some("high".into()),
-            context_window: None,
-            metadata: Value::Null,
-            machine: MachineSpec::Direct(DirectSpec { cwd: dir.path().to_str().unwrap().into(), env: None }),
-        })
+        .create_agent(AgentSpec { reasoning_effort: Some("high".into()), ..agent(dir.path(), &["read"]) })
         .unwrap();
-    harness.send(&id, "user", "Read README.md").unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Observation::State { state: AgentState::Idle | AgentState::Failed, .. } =
-                observations.recv().await.unwrap()
-            {
-                break;
-            }
-        }
-    })
-    .await
-    .unwrap();
-    let agent = harness.agent(&id).unwrap();
+    let agent = turn(&harness, &id, "Read README.md").await;
     assert_eq!(agent.state, AgentState::Idle, "{:?}", agent.error);
+    assert_eq!((agent.usage.cached_input, agent.usage.cache_write), (40, 60));
     {
         let script = server.script.lock().unwrap();
         assert_eq!(script.requests.len(), 2);
@@ -313,32 +318,8 @@ async fn malformed_tool_arguments_are_returned_to_the_model_and_can_be_corrected
             .open()
             .await
             .unwrap();
-        let mut observations = harness.subscribe();
-        let id = harness
-            .create_agent(AgentSpec {
-                system_prompt: "Test recovery".into(),
-                tools: vec!["count".into()],
-                provider: "claude".into(),
-                model: "claude-test".into(),
-                reasoning_effort: None,
-                context_window: None,
-                metadata: Value::Null,
-                machine: MachineSpec::Direct(DirectSpec { cwd: dir.path().to_str().unwrap().into(), env: None }),
-            })
-            .unwrap();
-        harness.send(&id, "user", "Call count").unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Observation::State { state: AgentState::Idle | AgentState::Failed, .. } =
-                    observations.recv().await.unwrap()
-                {
-                    break;
-                }
-            }
-        })
-        .await
-        .unwrap();
-        let agent = harness.agent(&id).unwrap();
+        let id = harness.create_agent(agent(dir.path(), &["count"])).unwrap();
+        let agent = turn(&harness, &id, "Call count").await;
         assert_eq!(agent.state, AgentState::Idle, "{raw:?}: {:?}", agent.error);
         assert_eq!(count.load(Ordering::SeqCst), 2, "invalid call must not execute: {raw:?}");
         let transcript = harness.transcript(&id).unwrap();
@@ -427,4 +408,25 @@ async fn truncated_stream_is_not_replayed_after_content() {
         .unwrap();
     assert!(error.to_string().contains("message_stop"));
     assert_eq!(server.script.lock().unwrap().requests.len(), 1);
+}
+
+#[tokio::test]
+async fn agent_mail_and_compactions_read_as_they_do_on_every_provider() {
+    let server = Server::new(vec![says()]).await;
+    let provider = Anthropic::new(server.config(false)).unwrap();
+    let items = [
+        Item::Compaction { summary: "Earlier work.".into() },
+        Item::Input { from: "agent-b".into(), text: "hi".into() },
+    ];
+    provider.complete(request(&items, &[]), &|_| {}).await.unwrap();
+    let body: Value = serde_json::from_str(&server.script.lock().unwrap().requests[0].1).unwrap();
+    let texts: Vec<&str> =
+        body["messages"][0]["content"].as_array().unwrap().iter().map(|b| b["text"].as_str().unwrap()).collect();
+    assert_eq!(
+        texts,
+        [
+            "The conversation so far was compacted. Summary:\n\nEarlier work.\n\nContinue from here.",
+            "[Message from agent agent-b]\nhi"
+        ]
+    );
 }

@@ -1,7 +1,7 @@
-//! Durable state. SQLite (WAL, `synchronous=NORMAL`) holds agent records and inboxes and is
-//! never exposed to sandboxes. Each transcript is an append-only JSONL file that other agents
-//! may read through a bind mount; readers take no locks, so they cannot stall the writer.
-//! Only finished items are written, never streaming deltas.
+//! Durable state. SQLite (WAL, `synchronous=NORMAL`) holds agent records and inboxes, and is
+//! never exposed to sandboxes. Each transcript is an append-only JSONL file of finished items,
+//! which other agents may read through a bind mount; readers take no locks, so they cannot
+//! stall the writer.
 
 use crate::agent::{AgentRecord, AgentSpec, AgentState, Entry, Item, Usage};
 use anyhow::{Context, Result};
@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS agents (
     cached_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
     reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     context_tokens INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
 );
@@ -49,29 +50,32 @@ CREATE TABLE IF NOT EXISTS inbox (
 CREATE INDEX IF NOT EXISTS inbox_pending ON inbox(agent) WHERE delivered_seq IS NULL;
 ";
 
-const COLUMNS: &str =
-    "id, spec, state, error, held, input_tokens, cached_tokens, output_tokens, reasoning_tokens, context_tokens";
+const COLUMNS: &str = "id, spec, state, error, held, input_tokens, cached_tokens, output_tokens, reasoning_tokens, \
+    context_tokens, cache_write_tokens";
 
-fn record(row: &rusqlite::Row) -> rusqlite::Result<Result<AgentRecord>> {
+fn record(row: &rusqlite::Row) -> rusqlite::Result<AgentRecord> {
+    let count = |index| row.get::<_, i64>(index).map(|n| n as u64);
     let spec: String = row.get(1)?;
-    let state: String = row.get(2)?;
-    let usage = Usage {
-        input: row.get::<_, i64>(5)? as u64,
-        cached_input: row.get::<_, i64>(6)? as u64,
-        output: row.get::<_, i64>(7)? as u64,
-        reasoning: row.get::<_, i64>(8)? as u64,
-    };
-    let (id, error, held, context_tokens) =
-        (row.get::<_, String>(0)?, row.get(3)?, row.get(4)?, row.get::<_, i64>(9)? as u64);
-    Ok(serde_json::from_str(&spec).map_err(Into::into).map(|spec| AgentRecord {
-        id,
-        spec,
-        state: AgentState::parse(&state),
-        error,
-        held,
-        usage,
-        context_tokens,
-    }))
+    Ok(AgentRecord {
+        id: row.get(0)?,
+        spec: serde_json::from_str(&spec)
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, e.into()))?,
+        state: AgentState::parse(&row.get::<_, String>(2)?),
+        error: row.get(3)?,
+        held: row.get(4)?,
+        usage: Usage {
+            input: count(5)?,
+            cached_input: count(6)?,
+            cache_write: count(10)?,
+            output: count(7)?,
+            reasoning: count(8)?,
+        },
+        context_tokens: count(9)?,
+    })
+}
+
+fn mail(row: &rusqlite::Row) -> rusqlite::Result<Mail> {
+    Ok(Mail { id: row.get(0)?, from: row.get(1)?, text: row.get(2)? })
 }
 
 pub fn now_ms() -> u64 {
@@ -88,48 +92,57 @@ impl Store {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.execute_batch(SCHEMA)?;
+        // A database without the cache-write column gains it, starting at zero.
+        let counted = connection
+            .prepare("SELECT 1 FROM pragma_table_info('agents') WHERE name = 'cache_write_tokens'")?
+            .exists([])?;
+        if !counted {
+            connection.execute_batch("ALTER TABLE agents ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0")?;
+        }
         Ok(Self { db: Mutex::new(connection), transcripts: transcripts.to_owned() })
+    }
+
+    fn execute(&self, sql: &str, params: impl rusqlite::Params) -> Result<()> {
+        self.db.lock().unwrap().execute(sql, params)?;
+        Ok(())
     }
 
     pub fn create_agent(&self, id: &str, spec: &AgentSpec) -> Result<()> {
         fs::create_dir_all(self.transcripts.join(id))?;
-        self.db.lock().unwrap().execute(
-            "INSERT INTO agents (id, spec, state, created_at) VALUES (?1, ?2, 'idle', ?3)",
-            params![id, serde_json::to_string(spec)?, now_ms() as i64],
-        )?;
-        Ok(())
+        let sql = "INSERT INTO agents (id, spec, state, created_at) VALUES (?1, ?2, 'idle', ?3)";
+        self.execute(sql, params![id, serde_json::to_string(spec)?, now_ms() as i64])
     }
 
     pub fn agent(&self, id: &str) -> Result<Option<AgentRecord>> {
         let db = self.db.lock().unwrap();
         let mut statement = db.prepare_cached(&format!("SELECT {COLUMNS} FROM agents WHERE id = ?1"))?;
-        statement.query_row([id], record).optional()?.transpose()
+        Ok(statement.query_row([id], record).optional()?)
     }
 
     pub fn agents(&self) -> Result<Vec<AgentRecord>> {
         let db = self.db.lock().unwrap();
         let mut statement = db.prepare_cached(&format!("SELECT {COLUMNS} FROM agents ORDER BY created_at, id"))?;
-        statement.query_map([], record)?.map(|row| row?).collect()
+        Ok(statement.query_map([], record)?.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn set_state(&self, id: &str, state: AgentState, error: Option<&str>) -> Result<()> {
-        self.db
-            .lock()
-            .unwrap()
-            .execute("UPDATE agents SET state = ?2, error = ?3 WHERE id = ?1", params![id, state.as_str(), error])?;
-        Ok(())
+        self.execute("UPDATE agents SET state = ?2, error = ?3 WHERE id = ?1", params![id, state.as_str(), error])
     }
 
     pub fn set_held(&self, id: &str, held: bool) -> Result<()> {
-        self.db.lock().unwrap().execute("UPDATE agents SET held = ?2 WHERE id = ?1", params![id, held])?;
-        Ok(())
+        self.execute("UPDATE agents SET held = ?2 WHERE id = ?1", params![id, held])
+    }
+
+    pub fn set_spec(&self, id: &str, spec: &AgentSpec) -> Result<()> {
+        self.execute("UPDATE agents SET spec = ?2 WHERE id = ?1", params![id, serde_json::to_string(spec)?])
     }
 
     /// Adds a request's usage to the totals and records how full the context now is.
     pub fn add_usage(&self, id: &str, usage: Usage, context: u64) -> Result<()> {
-        self.db.lock().unwrap().execute(
+        self.execute(
             "UPDATE agents SET input_tokens = input_tokens + ?2, cached_tokens = cached_tokens + ?3,
-             output_tokens = output_tokens + ?4, reasoning_tokens = reasoning_tokens + ?5, context_tokens = ?6
+             output_tokens = output_tokens + ?4, reasoning_tokens = reasoning_tokens + ?5, context_tokens = ?6,
+             cache_write_tokens = cache_write_tokens + ?7
              WHERE id = ?1",
             params![
                 id,
@@ -137,18 +150,10 @@ impl Store {
                 usage.cached_input as i64,
                 usage.output as i64,
                 usage.reasoning as i64,
-                context as i64
+                context as i64,
+                usage.cache_write as i64
             ],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_spec(&self, id: &str, spec: &AgentSpec) -> Result<()> {
-        self.db
-            .lock()
-            .unwrap()
-            .execute("UPDATE agents SET spec = ?2 WHERE id = ?1", params![id, serde_json::to_string(spec)?])?;
-        Ok(())
+        )
     }
 
     pub fn remove_agent(&self, id: &str) -> Result<()> {
@@ -171,11 +176,7 @@ impl Store {
             "SELECT id, sender, body FROM inbox WHERE agent = ?1 AND sender = ?2 AND id > ?3 AND delivered_seq IS NULL
              ORDER BY id LIMIT 1",
         )?;
-        Ok(statement
-            .query_row(params![agent, from, after], |row| {
-                Ok(Mail { id: row.get(0)?, from: row.get(1)?, text: row.get(2)? })
-            })
-            .optional()?)
+        Ok(statement.query_row(params![agent, from, after], mail).optional()?)
     }
 
     /// Agents a restarted harness must wake: those mid-turn, and those with unheld mail.
@@ -185,8 +186,7 @@ impl Store {
             "SELECT id FROM agents WHERE state = 'running'
              OR (held = 0 AND EXISTS (SELECT 1 FROM inbox WHERE inbox.agent = agents.id AND delivered_seq IS NULL))",
         )?;
-        let ids = statement.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
-        Ok(ids)
+        Ok(statement.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn enqueue(&self, agent: &str, from: &str, text: &str) -> Result<i64> {
@@ -203,17 +203,16 @@ impl Store {
         Ok(self.db.lock().unwrap().query_row("SELECT COALESCE(MAX(id), 0) FROM inbox", [], |row| row.get(0))?)
     }
 
+    /// Undelivered mail for `agent`, oldest first.
     pub fn pending(&self, agent: &str) -> Result<Vec<Mail>> {
         let db = self.db.lock().unwrap();
         let mut statement = db.prepare_cached(
             "SELECT id, sender, body FROM inbox WHERE agent = ?1 AND delivered_seq IS NULL ORDER BY id",
         )?;
-        let mail = statement
-            .query_map([agent], |row| Ok(Mail { id: row.get(0)?, from: row.get(1)?, text: row.get(2)? }))?
-            .collect::<Result<_, _>>()?;
-        Ok(mail)
+        Ok(statement.query_map([agent], mail)?.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Marks mail delivered, each id at the transcript entry that holds it.
     pub fn delivered(&self, deliveries: &[(i64, u64)]) -> Result<()> {
         let mut db = self.db.lock().unwrap();
         let transaction = db.transaction()?;

@@ -1,8 +1,8 @@
 //! Pi's `read` tool. Text is scanned as a stream, so reading a page of a huge file costs no
 //! more memory than the page itself.
 
-use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size, truncate_head};
-use super::{Content, Tool, ToolContext, ToolOutput, errors, js_number, resolve, string_arg};
+use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, format_size, truncate_head};
+use super::{Content, Tool, ToolContext, ToolOutput, errors, js_number, open, resolve, string_arg};
 use crate::machine::OpenMode;
 use base64::Engine;
 use futures_util::future::BoxFuture;
@@ -48,12 +48,7 @@ impl Tool for Read {
     }
 
     fn call<'a>(&'a self, context: &'a ToolContext, args: Value) -> BoxFuture<'a, ToolOutput> {
-        Box::pin(async move {
-            match read(context, &args).await {
-                Ok(output) => output,
-                Err(message) => ToolOutput::error(message),
-            }
-        })
+        Box::pin(async move { read(context, &args).await.unwrap_or_else(ToolOutput::error) })
     }
 }
 
@@ -63,8 +58,8 @@ async fn read(context: &ToolContext, args: &Value) -> Result<ToolOutput, String>
     let limit = args.get("limit").and_then(Value::as_f64);
     let machine = &context.machine;
     let absolute = resolve(path, machine.cwd(), machine.home());
-    let fd = machine.open(&absolute, OpenMode::Read).await.map_err(|e| errors::node(&e, "access", &absolute))?;
-    let file = tokio::fs::File::from_std(std::fs::File::from(fd));
+    let file =
+        open(machine.as_ref(), &absolute, OpenMode::Read).await.map_err(|e| errors::node(&e, "access", &absolute))?;
     let metadata = file.metadata().await.map_err(|e| errors::node(&e, "read", ""))?;
     if metadata.is_dir() {
         return Err(errors::node(&io::Error::from_raw_os_error(libc::EISDIR), "read", ""));
@@ -90,7 +85,7 @@ async fn read(context: &ToolContext, args: &Value) -> Result<ToolOutput, String>
     }
     let start = offset.map_or(0, |o| (o - 1.0).max(0.0) as usize);
     let wanted = limit.map(|l| l.max(0.0) as usize);
-    let page = scan(reader, start, wanted).await.map_err(|e| errors::node(&e, "read", ""))?;
+    let page = Page::scan(reader, start, wanted).await.map_err(|e| errors::node(&e, "read", ""))?;
     if start >= page.total_lines {
         return Err(format!(
             "Offset {} is beyond end of file ({} lines total)",
@@ -98,7 +93,7 @@ async fn read(context: &ToolContext, args: &Value) -> Result<ToolOutput, String>
             page.total_lines
         ));
     }
-    Ok(ToolOutput::text(format_page(path, start, wanted, &page)))
+    Ok(ToolOutput::text(format_page(path, wanted, &page)))
 }
 
 fn image_type(head: &[u8]) -> Option<&'static str> {
@@ -117,77 +112,89 @@ fn image_type(head: &[u8]) -> Option<&'static str> {
     }
 }
 
-/// The selected lines, kept only up to just past the output limits.
+/// The lines a read selects, kept only up to just past the output limits, and the counts its
+/// notices need.
 struct Page {
+    start: usize,
+    end: Option<usize>,
     lines: Vec<Vec<u8>>,
     /// Every line in the file, counting the empty one after a trailing newline, as
     /// JavaScript's `split("\n")` does.
     total_lines: usize,
     first_line_bytes: usize,
+    /// Cleared once past either limit: the page is certainly truncated, and the rest of the
+    /// file need only be counted.
+    storing: bool,
+    stored_bytes: usize,
+    line: Vec<u8>,
+    line_bytes: usize,
 }
 
-async fn scan(mut reader: BufReader<tokio::fs::File>, start: usize, wanted: Option<usize>) -> io::Result<Page> {
-    let store_limit = DEFAULT_MAX_BYTES + 1;
-    let mut page = Page { lines: Vec::new(), total_lines: 0, first_line_bytes: 0 };
-    let mut stored_bytes = 0usize;
-    let mut storing = true;
-    let mut current: Vec<u8> = Vec::new();
-    let mut current_len = 0usize;
-    let end = wanted.map(|w| start.saturating_add(w));
-    loop {
-        let chunk = reader.fill_buf().await?;
-        if chunk.is_empty() {
-            break;
-        }
-        let index = page.total_lines;
-        let selected = index >= start && end.is_none_or(|e| index < e);
-        let (piece, newline) = match chunk.iter().position(|&b| b == b'\n') {
-            Some(at) => (&chunk[..at], true),
-            None => (chunk, false),
+/// Longest part of a line kept; enough to know it exceeds the byte limit.
+const LINE_KEPT: usize = DEFAULT_MAX_BYTES + 1;
+
+impl Page {
+    async fn scan(mut reader: BufReader<tokio::fs::File>, start: usize, wanted: Option<usize>) -> io::Result<Self> {
+        let mut page = Page {
+            start,
+            end: wanted.map(|w| start.saturating_add(w)),
+            lines: Vec::new(),
+            total_lines: 0,
+            first_line_bytes: 0,
+            storing: true,
+            stored_bytes: 0,
+            line: Vec::new(),
+            line_bytes: 0,
         };
-        if selected && storing && current.len() < store_limit {
-            let room = store_limit - current.len();
-            current.extend_from_slice(&piece[..piece.len().min(room)]);
+        loop {
+            let chunk = reader.fill_buf().await?;
+            if chunk.is_empty() {
+                break;
+            }
+            let (piece, newline) = match chunk.iter().position(|&b| b == b'\n') {
+                Some(at) => (&chunk[..at], true),
+                None => (chunk, false),
+            };
+            page.take(piece);
+            let consumed = piece.len() + usize::from(newline);
+            reader.consume(consumed);
+            if newline {
+                page.end_line();
+            }
         }
-        current_len += piece.len();
-        let consumed = piece.len() + usize::from(newline);
-        reader.consume(consumed);
-        if newline {
-            finish_line(&mut page, &mut current, &mut current_len, selected, &mut storing, &mut stored_bytes, start);
-        }
+        page.end_line();
+        Ok(page)
     }
-    let index = page.total_lines;
-    let selected = index >= start && end.is_none_or(|e| index < e);
-    finish_line(&mut page, &mut current, &mut current_len, selected, &mut storing, &mut stored_bytes, start);
-    Ok(page)
+
+    fn selected(&self) -> bool {
+        self.total_lines >= self.start && self.end.is_none_or(|end| self.total_lines < end)
+    }
+
+    fn take(&mut self, piece: &[u8]) {
+        if self.selected() && self.storing && self.line.len() < LINE_KEPT {
+            let room = LINE_KEPT - self.line.len();
+            self.line.extend_from_slice(&piece[..piece.len().min(room)]);
+        }
+        self.line_bytes += piece.len();
+    }
+
+    fn end_line(&mut self) {
+        if self.total_lines == self.start {
+            self.first_line_bytes = self.line_bytes;
+        }
+        if self.selected() && self.storing {
+            self.stored_bytes += self.line.len() + usize::from(!self.lines.is_empty());
+            self.lines.push(std::mem::take(&mut self.line));
+            self.storing = self.lines.len() <= DEFAULT_MAX_LINES + 1 && self.stored_bytes <= DEFAULT_MAX_BYTES + 1;
+        }
+        self.line.clear();
+        self.line_bytes = 0;
+        self.total_lines += 1;
+    }
 }
 
-fn finish_line(
-    page: &mut Page,
-    current: &mut Vec<u8>,
-    current_len: &mut usize,
-    selected: bool,
-    storing: &mut bool,
-    stored_bytes: &mut usize,
-    start: usize,
-) {
-    if page.total_lines == start {
-        page.first_line_bytes = *current_len;
-    }
-    if selected && *storing {
-        *stored_bytes += current.len() + usize::from(!page.lines.is_empty());
-        page.lines.push(std::mem::take(current));
-        // Past either limit the page is certainly truncated; the rest need only be counted.
-        if page.lines.len() > DEFAULT_MAX_LINES + 1 || *stored_bytes > DEFAULT_MAX_BYTES + 1 {
-            *storing = false;
-        }
-    }
-    current.clear();
-    *current_len = 0;
-    page.total_lines += 1;
-}
-
-fn format_page(path: &str, start: usize, wanted: Option<usize>, page: &Page) -> String {
+fn format_page(path: &str, wanted: Option<usize>, page: &Page) -> String {
+    let start = page.start;
     let selected: Vec<String> = page.lines.iter().map(|l| String::from_utf8_lossy(l).into_owned()).collect();
     let content = selected.join("\n");
     let truncation = truncate_head(&content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
@@ -203,7 +210,7 @@ fn format_page(path: &str, start: usize, wanted: Option<usize>, page: &Page) -> 
         let end_display = start_display + truncation.output_lines - 1;
         let next = end_display + 1;
         let limit_note = match truncation.truncated_by {
-            Some(super::text::TruncatedBy::Bytes) => format!(" ({} limit)", format_size(DEFAULT_MAX_BYTES)),
+            Some(TruncatedBy::Bytes) => format!(" ({} limit)", format_size(DEFAULT_MAX_BYTES)),
             _ => String::new(),
         };
         return format!(

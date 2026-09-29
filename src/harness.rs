@@ -1,6 +1,6 @@
-//! The runtime. An idle agent costs a database row and a transcript file; nothing of it is
-//! in memory. Mail wakes an agent: a task loads its transcript, runs model calls and tools
-//! until there is nothing left to answer, then drops everything and exits.
+//! The runtime. An idle agent is a database row and a transcript file, with nothing in memory.
+//! Mail wakes it: a task loads the transcript, runs model calls and tools until nothing awaits
+//! an answer, then drops everything and exits.
 
 use crate::agent::{AgentRecord, AgentSpec, AgentState, Entry, Item, Observation};
 use crate::machine::{Direct, Machine, MachineSpec};
@@ -10,7 +10,7 @@ use crate::tools::{Mailbox, Reply, Tool, ToolContext, ToolOutput};
 use anyhow::{Context, Result, bail};
 use erissandbox::{Host, Sandboxes};
 use futures_util::future::BoxFuture;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,6 +18,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, Semaphore, broadcast};
 use tokio_util::sync::CancellationToken;
 
+/// Configures a [`Harness`]; start one with [`Harness::builder`].
 pub struct HarnessBuilder {
     host: Option<Host>,
     dir: PathBuf,
@@ -57,11 +58,13 @@ impl HarnessBuilder {
         self
     }
 
+    /// Registers a provider under the name agent specs use for it.
     pub fn provider(mut self, name: &str, provider: Arc<dyn Provider>) -> Self {
         self.providers.insert(name.to_owned(), provider);
         self
     }
 
+    /// Registers a tool under its own name.
     pub fn tool(mut self, tool: Arc<dyn Tool>) -> Self {
         self.tools.insert(tool.name().to_owned(), tool);
         self
@@ -77,13 +80,13 @@ impl HarnessBuilder {
         self
     }
 
-    /// Turns that may run at once; further woken agents wait for a slot.
+    /// Turns that may run at once; further woken agents wait for a slot. Defaults to 1024.
     pub fn max_concurrent_turns(mut self, turns: usize) -> Self {
         self.max_turns = turns;
         self
     }
 
-    /// How long an agent's sandbox stays live after its last command.
+    /// How long an agent's sandbox stays live after its last command. Defaults to 10 seconds.
     pub fn idle_grace(mut self, grace: Duration) -> Self {
         self.idle_grace = grace;
         self
@@ -123,11 +126,14 @@ impl HarnessBuilder {
     }
 }
 
+/// An agent's turn task, from waking until it settles.
 struct Run {
+    /// Cancelled by an interrupt, a removal, or shutdown.
     cancel: CancellationToken,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Runs agents: stores them, delivers their mail, and runs their turns.
 pub struct Harness {
     store: Store,
     host: Option<Host>,
@@ -137,6 +143,7 @@ pub struct Harness {
     recipients: HashMap<String, Arc<dyn Recipient>>,
     /// Agents blocked in a wait for a reply, signalled when their mail arrives.
     waiting: Mutex<HashMap<String, Arc<Notify>>>,
+    /// Slots for turns running at once.
     turns: Arc<Semaphore>,
     running: Mutex<HashMap<String, Run>>,
     observations: broadcast::Sender<Observation>,
@@ -150,9 +157,8 @@ pub struct Harness {
 struct Inboxes(std::sync::Weak<Harness>);
 
 impl Mailbox for Inboxes {
-    fn send(&self, from: &str, to: &str, text: &str) -> Result<i64> {
-        let harness = self.0.upgrade().context("harness stopped")?;
-        harness.send(to, from, text)
+    fn send(&self, to: &str, from: &str, text: &str) -> Result<i64> {
+        self.0.upgrade().context("harness stopped")?.send(to, from, text)
     }
 
     fn reply<'a>(&'a self, agent: &'a str, from: &'a str, after: i64) -> BoxFuture<'a, Result<Reply>> {
@@ -172,9 +178,12 @@ impl Drop for Waiting<'_> {
     }
 }
 
+/// How a turn ended.
 enum Ended {
+    /// Nothing awaits an answer.
     Idle,
     Interrupted,
+    /// The harness is shutting down; the agent stays as it is for the next harness to resume.
     Closing,
 }
 
@@ -192,6 +201,7 @@ fn visible(transcript: &Transcript) -> &[Entry] {
 }
 
 impl Harness {
+    /// A harness keeping its state in `dir`: `harness.db`, transcripts and sandboxes.
     pub fn builder(dir: impl AsRef<Path>) -> HarnessBuilder {
         HarnessBuilder {
             host: None,
@@ -206,6 +216,7 @@ impl Harness {
         }
     }
 
+    /// Stores a new agent and returns its id. It does nothing until mail arrives.
     pub fn create_agent(&self, spec: AgentSpec) -> Result<String> {
         self.validate(&spec)?;
         let id = uuid::Uuid::now_v7().simple().to_string();
@@ -251,6 +262,7 @@ impl Harness {
         self.store.remove_agent(id)
     }
 
+    /// The agent's record, or an error if there is no such agent.
     pub fn agent(&self, id: &str) -> Result<AgentRecord> {
         self.store.agent(id)?.with_context(|| format!("No agent {id}"))
     }
@@ -260,14 +272,17 @@ impl Harness {
         self.store.agents()
     }
 
+    /// Everything the agent has seen and done, including what compaction hides from the model.
     pub fn transcript(&self, id: &str) -> Result<Vec<Entry>> {
         Ok(self.store.transcript(id)?.entries)
     }
 
+    /// The agent's `transcript.jsonl`, one [`Entry`] per line.
     pub fn transcript_path(&self, id: &str) -> PathBuf {
         self.store.transcript_path(id)
     }
 
+    /// Live [`Observation`]s of every agent. A receiver that falls 4096 behind skips ahead.
     pub fn subscribe(&self) -> broadcast::Receiver<Observation> {
         self.observations.subscribe()
     }
@@ -277,15 +292,18 @@ impl Harness {
         self.sandboxes.as_ref().map_or(0, Sandboxes::live_count)
     }
 
-    /// Queues a message for `agent` from `"user"` or another agent's id. A user message
-    /// releases mail held by an interrupt.
+    /// Queues a message for `agent` from `"user"` or another agent's id. An idle agent starts
+    /// a turn; a busy one reads it at its next tool boundary. A user message releases mail held
+    /// by an interrupt.
     ///
-    /// Mail to a [`Recipient`]'s name goes to it. The result orders the mail: replies to it
-    /// come after it.
+    /// Mail to a [`Recipient`]'s name goes to it instead. The result places the mail in inbox
+    /// order: replies to it come after it.
     pub fn send(self: &Arc<Self>, agent: &str, from: &str, text: &str) -> Result<i64> {
         if let Some(recipient) = self.recipients.get(agent) {
+            // Taken first, so a reply sent during delivery still comes after it.
+            let position = self.store.last_mail()?;
             recipient.deliver(from, text)?;
-            return self.store.last_mail();
+            return Ok(position);
         }
         let record = self.agent(agent)?;
         let id = self.store.enqueue(agent, from, text)?;
@@ -301,6 +319,7 @@ impl Harness {
         Ok(id)
     }
 
+    /// Waits for mail to `agent` from `from` newer than `after`. `send` signals each arrival.
     async fn await_reply(&self, agent: &str, from: &str, after: i64) -> Result<Reply> {
         let notify = self.waiting.lock().unwrap().entry(agent.to_owned()).or_default().clone();
         let _waiting = Waiting(self, agent);
@@ -323,6 +342,8 @@ impl Harness {
         }
     }
 
+    /// Returns once the agent is in `state`. Idle and failed count only once its turn task has
+    /// ended, so mail sent just before this call is not mistaken for already handled.
     pub async fn wait_for(&self, agent: &str, state: AgentState) {
         let mut observations = self.subscribe();
         loop {
@@ -361,6 +382,7 @@ impl Harness {
         self.observe(Observation::State { agent: agent.to_owned(), state });
     }
 
+    /// Starts a turn task for the agent unless it has one.
     fn wake(self: &Arc<Self>, agent: &str) {
         if self.closing.is_cancelled() {
             return;
@@ -379,6 +401,7 @@ impl Harness {
         running.insert(agent.to_owned(), Run { cancel, task: Some(task) });
     }
 
+    /// Runs turns until one ends with no mail pending, then settles the agent's state.
     async fn run(self: Arc<Self>, agent: &str, cancel: CancellationToken) {
         let Ok(_slot) = self.turns.clone().acquire_owned().await else { return };
         loop {
@@ -400,7 +423,6 @@ impl Harness {
         }
     }
 
-    /// Delivers mail and runs model calls and tools until nothing awaits an answer.
     /// One model call, with its progress forwarded to observers: streamed text when `stream`,
     /// and holds, which always end with `Held { hold: None }`. `None` when the turn is
     /// cancelled.
@@ -434,6 +456,9 @@ impl Harness {
         completion
     }
 
+    /// Delivers mail and runs model calls and tools until nothing awaits an answer. When the
+    /// context is nearly full, the next call summarizes the conversation instead. It offers the
+    /// same tools as every call, so the conversation so far is read from the prompt cache.
     async fn turn(&self, agent: &str, cancel: &CancellationToken) -> Result<Ended> {
         let record = self.agent(agent)?;
         let spec = &record.spec;
@@ -453,8 +478,10 @@ impl Harness {
             }
             MachineSpec::Direct(direct) => Arc::new(Direct::new(direct.clone(), self.host.clone())),
         };
+        let context =
+            ToolContext { agent: agent.to_owned(), machine, mailbox: self.mailbox.clone(), cancel: cancel.clone() };
         let mut announced = record.state == AgentState::Running;
-        let mut context = record.context_tokens;
+        let mut context_tokens = record.context_tokens;
         loop {
             if cancel.is_cancelled() {
                 return Ok(if self.closing.is_cancelled() { Ended::Closing } else { Ended::Interrupted });
@@ -470,55 +497,48 @@ impl Harness {
                 self.set_state(agent, AgentState::Running, None);
                 announced = true;
             }
-            let request = |system, tools, items| Request {
+            let compacting = spec.context_window.is_some_and(|window| context_tokens * 10 > window * 8);
+            let mut items: Vec<Item> = visible(&transcript).iter().map(|e| e.item.clone()).collect();
+            if compacting {
+                items.push(Item::Input { from: "user".into(), text: COMPACT.into() });
+            }
+            let request = Request {
                 model: &spec.model,
                 reasoning_effort: spec.reasoning_effort.as_deref(),
                 cache_key: agent,
-                system,
-                tools,
-                items,
+                system: &system,
+                tools: &tool_specs,
+                items: &items,
             };
-            if spec.context_window.is_some_and(|window| context * 10 > window * 8) {
-                let mut items: Vec<Item> = visible(&transcript).iter().map(|e| e.item.clone()).collect();
-                items.push(Item::Input { from: "user".into(), text: COMPACT.into() });
-                let Some(completion) =
-                    self.call_model(agent, &**provider, request(&system, &[], &items), false, cancel).await?
-                else {
-                    continue;
-                };
-                self.store.add_usage(agent, completion.usage, 0)?;
-                context = 0;
-                let summary = completion
-                    .items
-                    .iter()
-                    .filter_map(|item| if let Item::Assistant { text } = item { Some(text.as_str()) } else { None })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                self.append(agent, &mut transcript, Item::Compaction { summary }, None)?;
-                continue;
-            }
-            let items: Vec<Item> = visible(&transcript).iter().map(|e| e.item.clone()).collect();
-            let Some(completion) =
-                self.call_model(agent, &**provider, request(&system, &tool_specs, &items), true, cancel).await?
-            else {
+            let Some(completion) = self.call_model(agent, &**provider, request, !compacting, cancel).await? else {
                 continue;
             };
             drop(items);
-            context = completion.usage.input;
-            self.store.add_usage(agent, completion.usage, context)?;
-            let mut calls = Vec::new();
-            for item in completion.items {
-                if let Item::ToolCall { call_id, name, arguments } = &item {
-                    calls.push((call_id.clone(), name.clone(), arguments.clone()));
+            // After a compaction attempt the next call proceeds and measures the context anew.
+            context_tokens = if compacting { 0 } else { completion.usage.input };
+            self.store.add_usage(agent, completion.usage, context_tokens)?;
+            self.observe(Observation::Usage { agent: agent.to_owned(), usage: completion.usage });
+            if compacting {
+                let summary: Vec<&str> = (completion.items.iter())
+                    .filter_map(|item| if let Item::Assistant { text } = item { Some(text.as_str()) } else { None })
+                    .collect();
+                // No summary, such as when the model called a tool instead: the context stays whole.
+                if !summary.is_empty() {
+                    self.append(agent, &mut transcript, Item::Compaction { summary: summary.join("\n") }, None)?;
                 }
+                continue;
+            }
+            let calls: Vec<(String, String, String)> = (completion.items.iter())
+                .filter_map(|item| match item {
+                    Item::ToolCall { call_id, name, arguments } => {
+                        Some((call_id.clone(), name.clone(), arguments.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for item in completion.items {
                 self.append(agent, &mut transcript, item, None)?;
             }
-            let context = ToolContext {
-                agent: agent.to_owned(),
-                machine: machine.clone(),
-                mailbox: self.mailbox.clone(),
-                cancel: cancel.child_token(),
-            };
             for (call_id, name, arguments) in calls {
                 let output = if cancel.is_cancelled() {
                     ToolOutput::error(SKIPPED_CALL)
@@ -526,8 +546,7 @@ impl Harness {
                     call_tool(&tools, &context, &name, &arguments).await
                 };
                 let delivers = output.delivers;
-                let seq = transcript.entries.len() as u64;
-                self.append(agent, &mut transcript, Item::ToolResult { call_id, output }, delivers)?;
+                let seq = self.append(agent, &mut transcript, Item::ToolResult { call_id, output }, delivers)?;
                 if let Some(mail) = delivers {
                     self.store.delivered(&[(mail, seq)])?;
                 }
@@ -535,10 +554,12 @@ impl Harness {
         }
     }
 
-    fn append(&self, agent: &str, transcript: &mut Transcript, item: Item, event: Option<i64>) -> Result<()> {
+    /// Appends an item and shows it to observers. Returns its sequence number.
+    fn append(&self, agent: &str, transcript: &mut Transcript, item: Item, event: Option<i64>) -> Result<u64> {
         let entry = transcript.append(item, event)?;
+        let seq = entry.seq;
         self.observe(Observation::Item { agent: agent.to_owned(), entry });
-        Ok(())
+        Ok(seq)
     }
 
     /// Appends queued mail as input. Mail already in the transcript (a crash between the
@@ -554,10 +575,7 @@ impl Harness {
             let seq = match present.get(&mail.id) {
                 Some(&seq) => seq,
                 None => {
-                    let item = Item::Input { from: mail.from, text: mail.text };
-                    let seq = transcript.entries.len() as u64;
-                    self.append(agent, transcript, item, Some(mail.id))?;
-                    seq
+                    self.append(agent, transcript, Item::Input { from: mail.from, text: mail.text }, Some(mail.id))?
                 }
             };
             delivered.push((mail.id, seq));
@@ -568,24 +586,18 @@ impl Harness {
     /// A harness that stopped mid-tool leaves calls without results; the model needs one
     /// for every call.
     fn close_dangling_calls(&self, agent: &str, transcript: &mut Transcript) -> Result<()> {
-        let answered: std::collections::HashSet<String> = transcript
-            .items()
-            .filter_map(|i| if let Item::ToolResult { call_id, .. } = i { Some(call_id.clone()) } else { None })
+        let answered: HashSet<&str> = (transcript.items())
+            .filter_map(|i| if let Item::ToolResult { call_id, .. } = i { Some(call_id.as_str()) } else { None })
             .collect();
-        let dangling: Vec<String> = transcript
-            .items()
+        let dangling: Vec<String> = (transcript.items())
             .filter_map(|i| match i {
-                Item::ToolCall { call_id, .. } if !answered.contains(call_id) => Some(call_id.clone()),
+                Item::ToolCall { call_id, .. } if !answered.contains(call_id.as_str()) => Some(call_id.clone()),
                 _ => None,
             })
             .collect();
         for call_id in dangling {
-            self.append(
-                agent,
-                transcript,
-                Item::ToolResult { call_id, output: ToolOutput::error(INTERRUPTED_CALL) },
-                None,
-            )?;
+            let output = ToolOutput::error(INTERRUPTED_CALL);
+            self.append(agent, transcript, Item::ToolResult { call_id, output }, None)?;
         }
         Ok(())
     }

@@ -461,6 +461,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.23.1",
+ "bytes",
  "erissandbox",
  "futures-util",
  "httpdate",
@@ -2358,3 +2359,11 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "erisforge"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "erisauth"
+version = "0.2.0"

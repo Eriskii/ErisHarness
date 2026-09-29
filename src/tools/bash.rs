@@ -3,12 +3,11 @@
 //! on the machine and only a tail window stays in memory.
 
 use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, format_size, truncate_tail};
-use super::{Tool, ToolContext, ToolOutput, js_number, string_arg};
+use super::{Tool, ToolContext, ToolOutput, deadline, js_number, open, string_arg};
 use crate::machine::{DRAIN_GRACE, Machine, OpenMode};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_TIMEOUT_SECONDS: f64 = 2_147_483.647;
@@ -45,12 +44,7 @@ impl Tool for Bash {
     }
 
     fn call<'a>(&'a self, context: &'a ToolContext, args: Value) -> BoxFuture<'a, ToolOutput> {
-        Box::pin(async move {
-            match bash(context, &args).await {
-                Ok(output) => output,
-                Err(message) => ToolOutput::error(message),
-            }
-        })
+        Box::pin(async move { bash(context, &args).await.unwrap_or_else(ToolOutput::error) })
     }
 }
 
@@ -86,12 +80,7 @@ async fn bash(context: &ToolContext, args: &Value) -> Result<ToolOutput, String>
     let killer = process.killer();
     let exit = process.wait();
     tokio::pin!(exit);
-    let expired = async {
-        match timeout {
-            Some(seconds) => tokio::time::sleep(Duration::from_secs_f64(seconds)).await,
-            None => std::future::pending().await,
-        }
-    };
+    let expired = deadline(timeout);
     tokio::pin!(expired);
     let mut collected = Collected::new(machine.clone());
     let mut buffer = vec![0u8; 16 * 1024];
@@ -220,8 +209,7 @@ impl Collected {
 
     async fn open_log(&mut self) {
         let path = format!("/tmp/bash-{}.log", uuid::Uuid::now_v7().simple());
-        if let Ok(fd) = self.machine.open(&path, OpenMode::Write { create_parents: true }).await {
-            let mut file = tokio::fs::File::from_std(std::fs::File::from(fd));
+        if let Ok(mut file) = open(self.machine.as_ref(), &path, OpenMode::Write { create_parents: true }).await {
             let _ = file.write_all(&self.kept).await;
             self.log = Some((path, file));
         }

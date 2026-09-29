@@ -16,8 +16,6 @@ pub enum TruncatedBy {
 pub struct Truncation {
     pub content: String,
     pub truncated_by: Option<TruncatedBy>,
-    pub total_lines: usize,
-    pub total_bytes: usize,
     pub output_lines: usize,
     pub output_bytes: usize,
     pub last_line_partial: bool,
@@ -33,8 +31,6 @@ impl Truncation {
         Self {
             content: content.to_owned(),
             truncated_by: None,
-            total_lines: lines,
-            total_bytes: content.len(),
             output_lines: lines,
             output_bytes: content.len(),
             last_line_partial: false,
@@ -44,7 +40,7 @@ impl Truncation {
 }
 
 /// Lines as Pi counts them: a trailing newline does not start another line.
-pub fn split_lines_for_counting(content: &str) -> Vec<&str> {
+fn split_lines_for_counting(content: &str) -> Vec<&str> {
     if content.is_empty() {
         return Vec::new();
     }
@@ -75,8 +71,6 @@ pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
         return Truncation {
             content: String::new(),
             truncated_by: Some(TruncatedBy::Bytes),
-            total_lines: lines.len(),
-            total_bytes: content.len(),
             output_lines: 0,
             output_bytes: 0,
             last_line_partial: false,
@@ -95,16 +89,11 @@ pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
         kept += 1;
         bytes += cost;
     }
-    if kept >= max_lines && bytes <= max_bytes {
-        by = TruncatedBy::Lines;
-    }
     let output = lines[..kept].join("\n");
     Truncation {
         output_bytes: output.len(),
         content: output,
         truncated_by: Some(by),
-        total_lines: lines.len(),
-        total_bytes: content.len(),
         output_lines: kept,
         last_line_partial: false,
         first_line_exceeds_limit: false,
@@ -149,8 +138,6 @@ pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
         output_bytes: output.len(),
         content: output,
         truncated_by: Some(by),
-        total_lines: lines.len(),
-        total_bytes: content.len(),
         output_lines: kept.len(),
         last_line_partial: partial,
         first_line_exceeds_limit: false,
@@ -385,7 +372,7 @@ mod tests {
         let t = truncate_head("a\nb\nc\n", 2, 100);
         assert_eq!(t.content, "a\nb");
         assert_eq!(t.truncated_by, Some(TruncatedBy::Lines));
-        assert_eq!((t.total_lines, t.output_lines), (3, 2));
+        assert_eq!(t.output_lines, 2);
 
         let t = truncate_head("aaaa\nbbbb\ncccc", 10, 9);
         assert_eq!(t.content, "aaaa\nbbbb");

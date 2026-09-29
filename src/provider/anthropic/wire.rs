@@ -1,14 +1,15 @@
-//! Conversion between provider-neutral transcript items and Anthropic content blocks.
+//! The request body: transcript items as Anthropic messages, the system prompt, tools, cache
+//! breakpoints and thinking settings, in the field order Claude Code sends them.
 
 use super::{AnthropicAuth, AnthropicConfig, CacheRetention, Thinking, fingerprint};
 use crate::agent::Item;
-use crate::provider::Request;
+use crate::provider::{Request, user_text};
 use crate::tools::Content;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 
 pub fn body(config: &AnthropicConfig, request: &Request, version: &str) -> Result<Value> {
-    let oauth = matches!(config.auth, AnthropicAuth::ClaudeCode(_));
+    let oauth = config.oauth();
     let cache = match config.cache_retention {
         CacheRetention::None => None,
         CacheRetention::Short => Some(json!({"type":"ephemeral"})),
@@ -19,20 +20,18 @@ pub fn body(config: &AnthropicConfig, request: &Request, version: &str) -> Resul
     let mut first_user = None;
     for item in request.items {
         let (role, blocks) = match item {
-            Item::Input { from, text } => {
-                let text = if from == "user" { text.clone() } else { format!("[From {from}]\n{text}") };
-                first_user.get_or_insert_with(|| text.clone());
-                let index = if messages.last().is_some_and(|m| m["role"] == "user") {
-                    messages.len() - 1
-                } else {
-                    messages.len()
-                };
-                if user_indices.last() != Some(&index) {
-                    user_indices.push(index);
+            Item::Input { .. } | Item::Compaction { .. } => {
+                let Some(text) = user_text(item) else { continue };
+                if matches!(item, Item::Input { .. }) {
+                    first_user.get_or_insert_with(|| text.clone());
+                    // Where this input lands: the open user message, or a new one.
+                    let index = messages.len() - usize::from(messages.last().is_some_and(|m| m["role"] == "user"));
+                    if user_indices.last() != Some(&index) {
+                        user_indices.push(index);
+                    }
                 }
                 ("user", vec![json!({"type":"text","text":text})])
             }
-            Item::Compaction { summary } => ("user", vec![json!({"type":"text","text":summary})]),
             Item::Assistant { text } if !text.is_empty() => ("assistant", vec![json!({"type":"text","text":text})]),
             Item::Reasoning { encrypted: Some(state), .. } => {
                 let Ok(state) = serde_json::from_str::<Value>(state) else { continue };

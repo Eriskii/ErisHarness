@@ -4,10 +4,9 @@
 //! writes again. With `wait`, the call returns the recipient's next message to the sender
 //! as its result instead of it arriving as mail.
 
-use super::{Tool, ToolContext, ToolOutput, js_number, string_arg};
+use super::{Tool, ToolContext, ToolOutput, deadline, js_number, string_arg};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
-use std::time::Duration;
 
 pub struct SendMessage;
 
@@ -50,7 +49,7 @@ impl Tool for SendMessage {
             if to == context.agent {
                 return ToolOutput::error("You cannot message yourself.");
             }
-            let sent = match context.mailbox.send(&context.agent, to, text) {
+            let sent = match context.mailbox.send(to, &context.agent, text) {
                 Ok(position) => position,
                 Err(error) => return ToolOutput::error(format!("{error:#}")),
             };
@@ -62,12 +61,6 @@ impl Tool for SendMessage {
                 });
             }
             let timeout = args.get("timeout_seconds").and_then(Value::as_f64).filter(|s| *s > 0.0);
-            let limit = async {
-                match timeout {
-                    Some(seconds) => tokio::time::sleep(Duration::from_secs_f64(seconds)).await,
-                    None => std::future::pending().await,
-                }
-            };
             tokio::select! {
                 reply = context.mailbox.reply(&context.agent, to, sent) => match reply {
                     Ok(reply) => {
@@ -77,7 +70,7 @@ impl Tool for SendMessage {
                     }
                     Err(error) => ToolOutput::error(format!("{error:#}")),
                 },
-                _ = limit => {
+                _ = deadline(timeout) => {
                     let seconds = timeout.unwrap_or_default();
                     let unit = if seconds == 1.0 { "second" } else { "seconds" };
                     ToolOutput::text(format!(

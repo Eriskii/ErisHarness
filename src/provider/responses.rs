@@ -1,18 +1,14 @@
-//! OpenAI Responses API, streamed. Requests are stateless (`store: false` by default): the
-//! whole transcript is sent each time, and encrypted reasoning is carried back in it.
+//! The OpenAI Responses API, streamed. Requests are stateless by default (`store: false`):
+//! the whole visible transcript is sent each time, carrying encrypted reasoning back with it.
 
-use super::http::{response_event, retry_after};
-use super::sse::Parser;
-use super::{Completion, Credentials, Progress, Provider, RateGate, Request};
+use super::transport::{self, Events, Failure};
+use super::{Completion, Credentials, Progress, Provider, RateGate, Request, user_text};
 use crate::agent::{Item, Usage};
 use crate::tools::{Content, ToolOutput};
-use anyhow::{Result, anyhow, bail};
-use futures_util::StreamExt;
+use anyhow::{Result, anyhow};
 use futures_util::future::BoxFuture;
-use reqwest::StatusCode;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::time::Duration;
 
 pub struct ResponsesConfig {
     /// Endpoint root; requests go to `{base_url}/responses`.
@@ -63,67 +59,31 @@ impl Responses {
     }
 
     async fn attempt(&self, body: &Value, progress: &(dyn Fn(Progress) + Send + Sync)) -> Result<Completion, Failure> {
-        let authorization = self.config.credentials.authorize().await.map_err(Failure::Fatal)?;
-        let mut builder = self
-            .client
-            .post(format!("{}/responses", self.config.base_url.trim_end_matches('/')))
-            .bearer_auth(&authorization.token)
-            .json(body);
+        let authorization = self.config.credentials.authorize().await.map_err(Failure::fatal)?;
+        let url = format!("{}/responses", self.config.base_url.trim_end_matches('/'));
+        let mut request = self.client.post(url).bearer_auth(&authorization.token).json(body);
         for (key, value) in self.config.headers.iter().chain(&authorization.headers) {
-            builder = builder.header(key, value);
+            request = request.header(key, value);
         }
-        let response = builder.send().await.map_err(|e| Failure::Retry(anyhow!(e), None))?;
-        let status = response.status();
-        progress(Progress::Event(response_event(status.as_u16(), response.headers())));
-        if !status.is_success() {
-            let wait = retry_after(response.headers());
-            let text = response.text().await.unwrap_or_default();
-            let message = serde_json::from_str::<Value>(&text)
-                .ok()
-                .and_then(|v| v["error"]["message"].as_str().map(str::to_owned))
-                .unwrap_or(text);
-            let error = anyhow!("{} {message}", status.as_u16());
-            return Err(if status == StatusCode::TOO_MANY_REQUESTS {
-                Failure::RateLimited(error, wait)
-            } else if status.is_server_error() {
-                Failure::Retry(error, wait)
-            } else {
-                Failure::Fatal(error)
-            });
-        }
-        let mut stream = response.bytes_stream();
-        let mut parser = Parser::default();
+        let mut events = Events::new(transport::send(request, progress).await?);
         let mut items = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| Failure::Retry(anyhow!(e), None))?;
-            for data in parser.feed(&chunk) {
-                let Ok(event) = serde_json::from_str::<Value>(&data) else { continue };
-                match event["type"].as_str().unwrap_or_default() {
-                    "response.output_text.delta" => {
-                        progress(Progress::Text(event["delta"].as_str().unwrap_or_default()))
-                    }
-                    "response.output_item.done" => items.extend(output_item(&event["item"])),
-                    "response.completed" | "response.incomplete" => {
-                        return Ok(Completion { items, usage: usage(&event["response"]["usage"]) });
-                    }
-                    "response.failed" | "error" => {
-                        let error = &event["response"]["error"];
-                        let message =
-                            error["message"].as_str().or(event["message"].as_str()).unwrap_or("response failed");
-                        return Err(Failure::Fatal(anyhow!("{message}")));
-                    }
-                    _ => {}
+        while let Some(data) = events.next().await {
+            let Ok(event) = serde_json::from_str::<Value>(&data.map_err(Failure::retry)?) else { continue };
+            match event["type"].as_str().unwrap_or_default() {
+                "response.output_text.delta" => progress(Progress::Text(event["delta"].as_str().unwrap_or_default())),
+                "response.output_item.done" => items.extend(output_item(&event["item"])),
+                "response.completed" | "response.incomplete" => {
+                    return Ok(Completion { items, usage: usage(&event["response"]["usage"]) });
                 }
+                "response.failed" | "error" => {
+                    let message = event["response"]["error"]["message"].as_str().or(event["message"].as_str());
+                    return Err(Failure::fatal(anyhow!("{}", message.unwrap_or("response failed"))));
+                }
+                _ => {}
             }
         }
-        Err(Failure::Retry(anyhow!("stream ended before the response completed"), None))
+        Err(Failure::retry(anyhow!("stream ended before the response completed")))
     }
-}
-
-enum Failure {
-    Retry(anyhow::Error, Option<Duration>),
-    RateLimited(anyhow::Error, Option<Duration>),
-    Fatal(anyhow::Error),
 }
 
 impl Provider for Responses {
@@ -134,35 +94,8 @@ impl Provider for Responses {
     ) -> BoxFuture<'a, Result<Completion>> {
         Box::pin(async move {
             let body = self.body(&request);
-            let mut backoff = Duration::from_millis(250);
-            let report = |hold| progress(Progress::Held(hold));
-            for attempt in 0..=self.config.max_retries {
-                let permit = self.config.gate.acquire(&report).await;
-                let (error, wait) = match self.attempt(&body, progress).await {
-                    Ok(completion) => {
-                        permit.succeeded();
-                        return Ok(completion);
-                    }
-                    Err(Failure::Fatal(error)) => return Err(error),
-                    Err(Failure::RateLimited(error, wait)) => {
-                        // The gate holds this call, and every other, until the provider's time.
-                        permit.rate_limited(wait.unwrap_or(backoff));
-                        (error, None)
-                    }
-                    Err(Failure::Retry(error, wait)) => {
-                        drop(permit);
-                        (error, Some(wait.unwrap_or(backoff)))
-                    }
-                };
-                if attempt == self.config.max_retries {
-                    return Err(error);
-                }
-                backoff = (backoff * 2).min(Duration::from_secs(30));
-                if let Some(wait) = wait {
-                    tokio::time::sleep(wait).await;
-                }
-            }
-            bail!("no attempts made")
+            transport::retrying(&self.config.gate, self.config.max_retries, progress, || self.attempt(&body, progress))
+                .await
         })
     }
 }
@@ -172,6 +105,7 @@ fn usage(value: &Value) -> Usage {
     Usage {
         input: n(&value["input_tokens"]),
         cached_input: n(&value["input_tokens_details"]["cached_tokens"]),
+        cache_write: 0,
         output: n(&value["output_tokens"]),
         reasoning: n(&value["output_tokens_details"]["reasoning_tokens"]),
     }
@@ -205,9 +139,8 @@ fn output_item(item: &Value) -> Option<Item> {
 
 fn input_item(item: &Item) -> Option<Value> {
     Some(match item {
-        Item::Input { from, text } => {
-            let text = if from == "user" { text.clone() } else { format!("[Message from agent {from}]\n{text}") };
-            json!({"role": "user", "content": [{"type": "input_text", "text": text}]})
+        Item::Input { .. } | Item::Compaction { .. } => {
+            json!({"role": "user", "content": [{"type": "input_text", "text": user_text(item)?}]})
         }
         Item::Assistant { text } => {
             json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]})
@@ -223,31 +156,26 @@ fn input_item(item: &Item) -> Option<Value> {
         Item::ToolResult { call_id, output } => {
             json!({"type": "function_call_output", "call_id": call_id, "output": tool_output(output)})
         }
-        Item::Compaction { summary } => json!({"role": "user", "content": [{"type": "input_text", "text":
-            format!("The conversation so far was compacted. Summary:\n\n{summary}\n\nContinue from here.")}]}),
     })
 }
 
 /// Plain text stays a string; results carrying images become a content list.
 fn tool_output(output: &ToolOutput) -> Value {
-    if output.content.iter().all(|c| matches!(c, Content::Text(_))) {
-        let text: String = output
-            .content
-            .iter()
-            .filter_map(|c| if let Content::Text(t) = c { Some(t.as_str()) } else { None })
-            .collect();
-        return Value::String(text);
+    let mut text = String::new();
+    for content in &output.content {
+        match content {
+            Content::Text(part) => text.push_str(part),
+            Content::Image { .. } => return Value::Array(output.content.iter().map(content_part).collect()),
+        }
     }
-    Value::Array(
-        output
-            .content
-            .iter()
-            .map(|c| match c {
-                Content::Text(text) => json!({"type": "input_text", "text": text}),
-                Content::Image { mime, data } => {
-                    json!({"type": "input_image", "image_url": format!("data:{mime};base64,{data}")})
-                }
-            })
-            .collect(),
-    )
+    Value::String(text)
+}
+
+fn content_part(content: &Content) -> Value {
+    match content {
+        Content::Text(text) => json!({"type": "input_text", "text": text}),
+        Content::Image { mime, data } => {
+            json!({"type": "input_image", "image_url": format!("data:{mime};base64,{data}")})
+        }
+    }
 }

@@ -1,6 +1,6 @@
 //! Pi's `write` tool.
 
-use super::{Tool, ToolContext, ToolOutput, errors, resolve, string_arg};
+use super::{Tool, ToolContext, ToolOutput, errors, open, resolve, string_arg};
 use crate::machine::OpenMode;
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
@@ -37,12 +37,7 @@ impl Tool for Write {
     }
 
     fn call<'a>(&'a self, context: &'a ToolContext, args: Value) -> BoxFuture<'a, ToolOutput> {
-        Box::pin(async move {
-            match write(context, &args).await {
-                Ok(output) => output,
-                Err(message) => ToolOutput::error(message),
-            }
-        })
+        Box::pin(async move { write(context, &args).await.unwrap_or_else(ToolOutput::error) })
     }
 }
 
@@ -51,11 +46,9 @@ async fn write(context: &ToolContext, args: &Value) -> Result<ToolOutput, String
     let content = string_arg(args, "content")?;
     let machine = &context.machine;
     let absolute = resolve(path, machine.cwd(), machine.home());
-    let fd = machine
-        .open(&absolute, OpenMode::Write { create_parents: true })
+    let mut file = open(machine.as_ref(), &absolute, OpenMode::Write { create_parents: true })
         .await
         .map_err(|e| errors::node(&e, "open", &absolute))?;
-    let mut file = tokio::fs::File::from_std(std::fs::File::from(fd));
     file.write_all(content.as_bytes()).await.map_err(|e| errors::node(&e, "write", ""))?;
     file.flush().await.map_err(|e| errors::node(&e, "write", ""))?;
     Ok(ToolOutput::text(format!("Successfully wrote to {path}")))

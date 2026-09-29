@@ -105,81 +105,99 @@ fn main() -> anyhow::Result<()> {
             .idle_grace(Duration::from_secs(600))
             .open()
             .await?;
-        let agent_spec = AgentSpec { system_prompt: "bench".into(), tools: vec!["bash".into()], provider: "stub".into(), model: "stub".into(), reasoning_effort: None, context_window: None, metadata: serde_json::Value::Null, machine: MachineSpec::Sandbox(spec.clone()) };
-
-        let before = self_rss();
-        let started = Instant::now();
-        for _ in 0..idle {
-            harness.create_agent(agent_spec.clone())?;
-        }
-        let after = self_rss();
-        println!(
-            "idle agents: {idle} created in {:.1}s; harness RSS {} -> {} KiB ({:.2} KiB per agent)",
-            started.elapsed().as_secs_f64(),
-            before,
-            after,
-            (after.saturating_sub(before)) as f64 / idle as f64
-        );
-
-        let sandboxes = Arc::new(Sandboxes::new(&host, dir.path().join("live"))?.idle_grace(Duration::from_secs(600)));
-        let before = self_rss();
-        let started = Instant::now();
-        let mut handles = Vec::new();
-        for chunk in (0..live).collect::<Vec<_>>().chunks(64) {
-            let batch = chunk.iter().map(|i| {
-                let sandbox = sandboxes.sandbox(&format!("live-{i}"), spec.clone()).unwrap();
-                async move {
-                    sandbox.run(&["/bin/bash".into(), "-c".into(), "sleep 3600 >/dev/null 2>&1 &".into()]).await.map(|_| sandbox)
-                }
-            });
-            for result in futures_util::future::join_all(batch).await {
-                handles.push(result?);
-            }
-        }
-        let (pss, charged, processes) = sandbox_memory();
-        let after = self_rss();
-        println!(
-            "live sandboxes: {live} started in {:.1}s; {processes} processes; PSS {:.0} KiB/sandbox; cgroup charge {:.0} KiB/sandbox; harness RSS +{:.1} KiB/sandbox",
-            started.elapsed().as_secs_f64(),
-            pss as f64 / live as f64,
-            charged as f64 / live as f64,
-            after.saturating_sub(before) as f64 / live as f64
-        );
-        sandboxes.shutdown_all().await;
-        drop(handles);
-
-        let ids: Vec<String> = (0..turns).map(|_| harness.create_agent(agent_spec.clone())).collect::<anyhow::Result<_>>()?;
-        let before = self_rss();
-        let started = Instant::now();
-        for id in &ids {
-            harness.send(id, "user", "go")?;
-        }
-        let mut peak = (0, 0, 0, 0);
-        loop {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            let (pss, charged, processes) = sandbox_memory();
-            let rss = self_rss();
-            if rss + pss > peak.0 + peak.1 {
-                peak = (rss, pss, charged, processes);
-            }
-            let done = ids.iter().filter(|id| harness.agent(id).is_ok_and(|a| a.state == AgentState::Idle && !a.held)).count();
-            let answered = ids
-                .iter()
-                .filter(|id| harness.transcript(id).is_ok_and(|t| matches!(t.last().map(|e| &e.item), Some(Item::Assistant { .. }))))
-                .count();
-            if answered == turns && done == turns {
-                break;
-            }
-        }
-        println!(
-            "concurrent turns: {turns} finished in {:.1}s; at peak {} processes, harness RSS +{:.1} KiB/turn, sandbox PSS {:.0} KiB/turn, cgroup charge {:.0} KiB/turn",
-            started.elapsed().as_secs_f64(),
-            peak.3,
-            peak.0.saturating_sub(before) as f64 / turns as f64,
-            peak.1 as f64 / turns as f64,
-            peak.2 as f64 / turns as f64
-        );
+        let agent = AgentSpec {
+            system_prompt: "bench".into(),
+            tools: vec!["bash".into()],
+            provider: "stub".into(),
+            model: "stub".into(),
+            reasoning_effort: None,
+            context_window: None,
+            metadata: serde_json::Value::Null,
+            machine: MachineSpec::Sandbox(spec.clone()),
+        };
+        idle_agents(&harness, &agent, idle)?;
+        let sandboxes = Sandboxes::new(&host, dir.path().join("live"))?.idle_grace(Duration::from_secs(600));
+        live_sandboxes(&sandboxes, &spec, live).await?;
+        concurrent_turns(&harness, &agent, turns).await?;
         harness.shutdown().await;
         anyhow::Ok(())
     })
+}
+
+fn idle_agents(harness: &Harness, agent: &AgentSpec, idle: usize) -> anyhow::Result<()> {
+    let before = self_rss();
+    let started = Instant::now();
+    for _ in 0..idle {
+        harness.create_agent(agent.clone())?;
+    }
+    let after = self_rss();
+    let seconds = started.elapsed().as_secs_f64();
+    let each = after.saturating_sub(before) as f64 / idle as f64;
+    println!(
+        "idle agents: {idle} created in {seconds:.1}s; harness RSS {before} -> {after} KiB ({each:.2} KiB per agent)"
+    );
+    Ok(())
+}
+
+async fn live_sandboxes(sandboxes: &Sandboxes, spec: &SandboxSpec, live: usize) -> anyhow::Result<()> {
+    let before = self_rss();
+    let started = Instant::now();
+    let background = ["/bin/bash".into(), "-c".into(), "sleep 3600 >/dev/null 2>&1 &".into()];
+    let mut handles = Vec::new();
+    for chunk in (0..live).collect::<Vec<_>>().chunks(64) {
+        let batch = chunk.iter().map(|i| {
+            let sandbox = sandboxes.sandbox(&format!("live-{i}"), spec.clone()).unwrap();
+            let background = &background;
+            async move { sandbox.run(background).await.map(|_| sandbox) }
+        });
+        for result in futures_util::future::join_all(batch).await {
+            handles.push(result?);
+        }
+    }
+    let (pss, charged, processes) = sandbox_memory();
+    let seconds = started.elapsed().as_secs_f64();
+    let per = |kib: u64| kib as f64 / live as f64;
+    println!(
+        "live sandboxes: {live} started in {seconds:.1}s; {processes} processes; PSS {:.0} KiB/sandbox; \
+         cgroup charge {:.0} KiB/sandbox; harness RSS +{:.1} KiB/sandbox",
+        per(pss),
+        per(charged),
+        per(self_rss().saturating_sub(before))
+    );
+    sandboxes.shutdown_all().await;
+    Ok(())
+}
+
+async fn concurrent_turns(harness: &Arc<Harness>, agent: &AgentSpec, turns: usize) -> anyhow::Result<()> {
+    let ids: Vec<String> = (0..turns).map(|_| harness.create_agent(agent.clone())).collect::<anyhow::Result<_>>()?;
+    let before = self_rss();
+    let started = Instant::now();
+    for id in &ids {
+        harness.send(id, "user", "go")?;
+    }
+    let settled = |id: &String| {
+        let idle = harness.agent(id).is_ok_and(|a| a.state == AgentState::Idle && !a.held);
+        let answered =
+            harness.transcript(id).is_ok_and(|t| matches!(t.last().map(|e| &e.item), Some(Item::Assistant { .. })));
+        idle && answered
+    };
+    let (mut rss, mut pss, mut charged, mut processes) = (0, 0, 0, 0);
+    while !ids.iter().all(settled) {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let (now_pss, now_charged, now_processes) = sandbox_memory();
+        let now_rss = self_rss();
+        if now_rss + now_pss > rss + pss {
+            (rss, pss, charged, processes) = (now_rss, now_pss, now_charged, now_processes);
+        }
+    }
+    let seconds = started.elapsed().as_secs_f64();
+    let per = |kib: u64| kib as f64 / turns as f64;
+    println!(
+        "concurrent turns: {turns} finished in {seconds:.1}s; at peak {processes} processes, harness RSS +{:.1} KiB/turn, \
+         sandbox PSS {:.0} KiB/turn, cgroup charge {:.0} KiB/turn",
+        per(rss.saturating_sub(before)),
+        per(pss),
+        per(charged)
+    );
+    Ok(())
 }

@@ -2,7 +2,7 @@
 //! non-overlapping blocks, preserving the file's BOM and line endings.
 
 use super::text::{self, Edit as Replacement};
-use super::{Tool, ToolContext, ToolOutput, errors, resolve};
+use super::{Tool, ToolContext, ToolOutput, errors, open, resolve};
 use crate::machine::OpenMode;
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
@@ -56,12 +56,7 @@ impl Tool for Edit {
     }
 
     fn call<'a>(&'a self, context: &'a ToolContext, args: Value) -> BoxFuture<'a, ToolOutput> {
-        Box::pin(async move {
-            match edit(context, args).await {
-                Ok(output) => output,
-                Err(message) => ToolOutput::error(message),
-            }
-        })
+        Box::pin(async move { edit(context, args).await.unwrap_or_else(ToolOutput::error) })
     }
 }
 
@@ -94,11 +89,9 @@ async fn edit(context: &ToolContext, args: Value) -> Result<ToolOutput, String> 
     let path = args.get("path").and_then(Value::as_str).ok_or("Edit tool input is invalid. path must be a string.")?;
     let machine = &context.machine;
     let absolute = resolve(path, machine.cwd(), machine.home());
-    let fd = machine
-        .open(&absolute, OpenMode::Update)
+    let mut file = open(machine.as_ref(), &absolute, OpenMode::Update)
         .await
         .map_err(|e| format!("Could not edit file: {path}. Error code: {}.", errors::code(&e)))?;
-    let mut file = tokio::fs::File::from_std(std::fs::File::from(fd));
     let mut raw = Vec::new();
     file.read_to_end(&mut raw).await.map_err(|e| errors::node(&e, "read", ""))?;
     let raw = String::from_utf8_lossy(&raw);
@@ -107,10 +100,13 @@ async fn edit(context: &ToolContext, args: Value) -> Result<ToolOutput, String> 
     let normalized = text::normalize_to_lf(content);
     let (base, new) = text::apply_edits(&normalized, &edits, path)?;
     let output = format!("{bom}{}", text::restore_line_endings(&new, ending));
-    file.seek(SeekFrom::Start(0)).await.map_err(|e| errors::node(&e, "write", ""))?;
-    file.set_len(0).await.map_err(|e| errors::node(&e, "write", ""))?;
-    file.write_all(output.as_bytes()).await.map_err(|e| errors::node(&e, "write", ""))?;
-    file.flush().await.map_err(|e| errors::node(&e, "write", ""))?;
+    let rewrite = async {
+        file.seek(SeekFrom::Start(0)).await?;
+        file.set_len(0).await?;
+        file.write_all(output.as_bytes()).await?;
+        file.flush().await
+    };
+    rewrite.await.map_err(|e| errors::node(&e, "write", ""))?;
     let diff = similar::TextDiff::from_lines(&base, &new);
     let patch = diff.unified_diff().context_radius(4).header(path, path).to_string();
     let first_changed_line =

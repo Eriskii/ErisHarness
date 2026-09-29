@@ -1,6 +1,6 @@
-//! Where an agent's commands and file operations happen. An ErisSandbox [`Sandbox`] isolates
-//! them; [`Direct`] runs them on this machine as this user, in a working directory. Tools see
-//! only the [`Machine`] trait, so both behave identically to the model.
+//! Where an agent's commands and file operations happen: an ErisSandbox [`Sandbox`], which
+//! isolates them, or [`Direct`], which runs them on this machine as this user. Tools see only
+//! the [`Machine`] trait, so the model cannot tell them apart.
 
 pub use erissandbox::{DRAIN_GRACE, ExitStatus, Killer, OpenMode, Output, Process, SandboxSpec};
 
@@ -43,7 +43,6 @@ pub struct DirectSpec {
     pub env: Option<Vec<(String, String)>>,
 }
 
-/// How [`Machine::open`] opens a path.
 /// Runs `argv` to completion and collects its output.
 pub async fn run(machine: &dyn Machine, argv: &[String]) -> Result<Output> {
     let mut bytes = Vec::new();
@@ -69,7 +68,7 @@ impl Machine for Sandbox {
     }
 }
 
-/// Reaps under the lock a killer takes, so a kill never races a pid being freed.
+/// Reaps under the lock a kill takes, so a kill never races the pid being freed.
 async fn reap_unless_killing(pidfd: &AsyncFd<OwnedFd>, reaped: &Mutex<bool>) -> ExitStatus {
     let _ = pidfd.readable().await;
     let mut reaped = reaped.lock().unwrap();
@@ -95,9 +94,6 @@ impl Direct {
     }
 
     async fn start(&self, argv: &[String], cwd: &str) -> Result<Process> {
-        if argv.is_empty() {
-            bail!("empty command");
-        }
         if !Path::new(cwd).is_dir() {
             bail!("Working directory does not exist: {cwd}");
         }

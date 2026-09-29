@@ -1,5 +1,6 @@
-//! Incremental Anthropic SSE decoder. Only finished blocks enter the transcript.
-//! Tool arguments stay verbatim so malformed model output can receive a tool error.
+//! Decodes a streamed Anthropic message. Text streams to observers as it arrives; items are
+//! built only from finished blocks. Tool arguments stay verbatim, so malformed JSON reaches
+//! the harness, which answers it with a tool error.
 
 use crate::agent::{Item, Usage};
 use crate::provider::{Completion, Progress};
@@ -7,8 +8,10 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-#[derive(Default)]
-pub struct Stream {
+pub struct Stream<'a> {
+    model: &'a str,
+    /// Tool names arrive in Claude Code's prefixed form.
+    oauth: bool,
     blocks: BTreeMap<u64, Block>,
     usage: Value,
     started: bool,
@@ -21,14 +24,13 @@ struct Block {
     stopped: bool,
 }
 
-impl Stream {
-    pub fn event(
-        &mut self,
-        event: Value,
-        model: &str,
-        oauth: bool,
-        progress: &(dyn Fn(Progress) + Send + Sync),
-    ) -> Result<Option<Completion>> {
+impl<'a> Stream<'a> {
+    pub fn new(model: &'a str, oauth: bool) -> Self {
+        Self { model, oauth, blocks: BTreeMap::new(), usage: Value::Null, started: false, stop: None }
+    }
+
+    /// Takes the next event; returns the completion once the message stops.
+    pub fn event(&mut self, event: Value, progress: &(dyn Fn(Progress) + Send + Sync)) -> Result<Option<Completion>> {
         match event["type"].as_str().context("Anthropic event is missing type")? {
             "ping" => {}
             "message_start" => {
@@ -119,7 +121,9 @@ impl Stream {
                             }
                             items.push(Item::Reasoning {
                                 summary: v["thinking"].as_str().map(|s| vec![s.into()]).unwrap_or_default(),
-                                encrypted: Some(json!({"provider":"anthropic","model":model,"block":v}).to_string()),
+                                encrypted: Some(
+                                    json!({"provider":"anthropic","model":self.model,"block":v}).to_string(),
+                                ),
                             });
                         }
                         Some("tool_use") => {
@@ -127,7 +131,7 @@ impl Stream {
                             let name = v["name"].as_str().context("tool_use is missing name")?;
                             items.push(Item::ToolCall {
                                 call_id: id.into(),
-                                name: if oauth { super::fingerprint::decode_tool(name) } else { name }.into(),
+                                name: if self.oauth { super::fingerprint::decode_tool(name) } else { name }.into(),
                                 arguments: block.json.clone().unwrap_or_else(|| v["input"].to_string()),
                             });
                         }
@@ -141,16 +145,12 @@ impl Stream {
                     usage: Usage {
                         input: n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens"),
                         cached_input: n("cache_read_input_tokens"),
+                        cache_write: n("cache_creation_input_tokens"),
                         output: n("output_tokens"),
                         reasoning: 0,
                     },
                 }));
             }
-            "error" => bail!(
-                "{}: {}",
-                event["error"]["type"].as_str().unwrap_or("api_error"),
-                event["error"]["message"].as_str().unwrap_or("Anthropic stream error")
-            ),
             _ => {}
         }
         Ok(None)

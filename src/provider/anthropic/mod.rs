@@ -1,67 +1,89 @@
-//! Anthropic Messages transport with explicit API-key or Claude subscription OAuth mode.
-//! Claude Code fingerprinting is confined to this provider. Credentials are supplied by
-//! the host through `Credentials`, exactly as with the Responses provider.
+//! The Anthropic Messages API, by API key or by Claude subscription (OAuth). A subscription
+//! request carries Claude Code's identity, which lives entirely in [`fingerprint`]; [`wire`]
+//! converts transcripts to messages and [`stream`] decodes the streamed reply.
 
 pub mod fingerprint;
 mod stream;
 mod wire;
 
-use super::http::{response_event, retry_after};
-use super::sse::Parser;
-use super::{Completion, Credentials, Progress, Provider, ProviderEvent, RateGate, Request};
+use super::transport::{self, Events, Failure, Kind};
+use super::{Authorization, Completion, Credentials, Progress, Provider, RateGate, Request};
 use anyhow::{Result, anyhow, ensure};
-use futures_util::{StreamExt, future::BoxFuture};
+use futures_util::future::BoxFuture;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[derive(Clone, Debug)]
-pub struct ClaudeCode {
-    /// Stable installation identity, used with account_id to derive OMP's device hash.
-    pub install_id: String,
-    pub account_id: Option<String>,
-    /// None: pinned fallback, with server-directed version upgrades. An explicit version
-    /// (or PI_AI_CLAUDE_CODE_VERSION) disables upgrades, as in OMP.
-    pub version: Option<String>,
-}
+/// Betas an API-key request with thinking asks for.
+const API_KEY_BETAS: &str = "interleaved-thinking-2025-05-14,context-management-2025-06-27,effort-2025-11-24";
 
 #[derive(Clone, Debug)]
 pub enum AnthropicAuth {
+    /// The credential's token is an API key, sent as `x-api-key`.
     ApiKey,
+    /// The credential's token is a Claude subscription's OAuth token, sent as a bearer token
+    /// on requests that identify as Claude Code.
     ClaudeCode(ClaudeCode),
 }
 
-/// Model capabilities are explicit, so adding a model never changes the harness runtime.
+#[derive(Clone, Debug)]
+pub struct ClaudeCode {
+    /// Stable per installation; with `account_id`, it derives the device id.
+    pub install_id: String,
+    pub account_id: Option<String>,
+    /// The Claude Code version to claim. `None` claims [`fingerprint::DEFAULT_VERSION`] (or
+    /// `PI_AI_CLAUDE_CODE_VERSION`) and adopts a newer one when the server requires it; a
+    /// version given here or in that variable is kept.
+    pub version: Option<String>,
+}
+
+/// How the model thinks. It is set per provider rather than inferred from the model name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Thinking {
     Disabled,
-    Adaptive { display: bool },
-    Budget { tokens: u64, display: bool },
+    /// The model decides how much to think; the agent's reasoning effort guides it.
+    Adaptive {
+        display: bool,
+    },
+    /// At most `tokens` of thinking: at least 1024 and below `max_tokens`.
+    Budget {
+        tokens: u64,
+        display: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheRetention {
     None,
+    /// Five minutes.
     Short,
+    /// One hour.
     Long,
 }
 
 pub struct AnthropicConfig {
-    /// Endpoint root including /v1. OAuth calls append /messages?beta=true.
+    /// Endpoint root including `/v1`; requests go to `{base_url}/messages`.
     pub base_url: String,
     pub auth: AnthropicAuth,
     pub credentials: Arc<dyn Credentials>,
+    /// Paces calls for the account; share one gate among every provider using the account.
     pub gate: Arc<RateGate>,
+    /// Attempts after the first for rate limits, server errors and dropped connections.
     pub max_retries: u32,
+    /// Output ceiling. Subscriptions are held to 64,000.
     pub max_tokens: u64,
     pub thinking: Thinking,
     pub cache_retention: CacheRetention,
+    /// Longest a whole request may take, streaming included.
     pub timeout: Duration,
-    /// Extra headers; identity and authorization headers remain owned by this provider.
+    /// Sent with every request. Authentication and Claude Code identity headers override them.
     pub headers: Vec<(String, String)>,
 }
 
 impl AnthropicConfig {
+    /// Defaults: the public API, 3 retries, 64,000 output tokens, no thinking, a 10-minute
+    /// timeout, and prompt caching for an hour on a subscription or five minutes on a key.
     pub fn new(credentials: Arc<dyn Credentials>, auth: AnthropicAuth) -> Self {
         let oauth = matches!(auth, AnthropicAuth::ClaudeCode(_));
         Self {
@@ -77,18 +99,24 @@ impl AnthropicConfig {
             headers: Vec::new(),
         }
     }
+
+    fn oauth(&self) -> bool {
+        matches!(self.auth, AnthropicAuth::ClaudeCode(_))
+    }
 }
 
 pub struct Anthropic {
     config: AnthropicConfig,
     client: reqwest::Client,
+    /// The Claude Code version requests claim.
     version: Mutex<String>,
-    pinned: bool,
+    /// Whether the server may move `version` forward: a subscription with no version pinned.
+    upgradable: bool,
 }
 
 impl Anthropic {
     pub fn new(config: AnthropicConfig) -> Result<Self> {
-        let explicit = match &config.auth {
+        let pinned = match &config.auth {
             AnthropicAuth::ClaudeCode(identity) => {
                 ensure!(!identity.install_id.is_empty(), "Claude Code install_id must not be empty");
                 identity
@@ -98,15 +126,15 @@ impl Anthropic {
             }
             AnthropicAuth::ApiKey => None,
         };
-        let pinned = explicit.is_some();
-        let version = explicit.unwrap_or_else(|| fingerprint::DEFAULT_VERSION.into());
+        let upgradable = config.oauth() && pinned.is_none();
+        let version = pinned.unwrap_or_else(|| fingerprint::DEFAULT_VERSION.into());
         fingerprint::validate_version(&version)?;
         let client = reqwest::Client::builder()
             .timeout(config.timeout)
             .connect_timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        Ok(Self { config, client, version: Mutex::new(version), pinned })
+        Ok(Self { config, client, version: Mutex::new(version), upgradable })
     }
 
     async fn attempt(
@@ -114,170 +142,102 @@ impl Anthropic {
         request: &Request<'_>,
         progress: &(dyn Fn(Progress) + Send + Sync),
     ) -> Result<Completion, Failure> {
-        let oauth = matches!(self.config.auth, AnthropicAuth::ClaudeCode(_));
+        let oauth = self.config.oauth();
         let version = self.version.lock().unwrap().clone();
         let body = wire::body(&self.config, request, &version).map_err(Failure::fatal)?;
         let bytes = fingerprint::serialize(&body, oauth).map_err(Failure::fatal)?;
         let authorization = self.config.credentials.authorize().await.map_err(Failure::fatal)?;
-        let mut headers = reqwest::header::HeaderMap::new();
-        for (key, value) in self.config.headers.iter().chain(&authorization.headers) {
-            let key = reqwest::header::HeaderName::from_bytes(key.as_bytes()).map_err(|e| Failure::fatal(e.into()))?;
-            let value = reqwest::header::HeaderValue::from_str(value).map_err(|e| Failure::fatal(e.into()))?;
-            headers.insert(key, value);
-        }
-        // Never allow another auth mode to leak alongside the selected credential.
-        headers.remove("authorization");
-        headers.remove("x-api-key");
-        headers.insert("content-type", "application/json".parse().unwrap());
-        headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
-        if oauth {
-            for (key, value) in fingerprint::headers(
-                &version,
-                request.cache_key,
-                !request.tools.is_empty() || self.config.thinking != Thinking::Disabled,
-                self.config.thinking != Thinking::Disabled,
-            ) {
-                headers.insert(
-                    reqwest::header::HeaderName::from_bytes(key.as_bytes()).unwrap(),
-                    value.parse().map_err(|e: reqwest::header::InvalidHeaderValue| Failure::fatal(e.into()))?,
-                );
-            }
-        } else {
-            headers.insert("accept", "text/event-stream".parse().unwrap());
-            if self.config.thinking != Thinking::Disabled {
-                headers.insert(
-                    "anthropic-beta",
-                    "interleaved-thinking-2025-05-14,context-management-2025-06-27,effort-2025-11-24".parse().unwrap(),
-                );
-            }
-        }
-        let mut auth = reqwest::header::HeaderValue::from_str(&if oauth {
-            format!("Bearer {}", authorization.token)
-        } else {
-            authorization.token
-        })
-        .map_err(|e| Failure::fatal(e.into()))?;
-        auth.set_sensitive(true);
-        headers.insert(if oauth { "authorization" } else { "x-api-key" }, auth);
+        let headers = self.headers(request, &version, authorization).map_err(Failure::fatal)?;
         let url =
             format!("{}/messages{}", self.config.base_url.trim_end_matches('/'), if oauth { "?beta=true" } else { "" });
-        let response = self
-            .client
-            .post(url)
-            .headers(headers)
-            .body(bytes)
-            .send()
-            .await
-            .map_err(|e| Failure::retry(e.into(), None, None))?;
-        let status = response.status();
-        let wait = retry_after(response.headers());
-        progress(Progress::Event(response_event(status.as_u16(), response.headers())));
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            let value: Value = serde_json::from_str(&text).unwrap_or_default();
-            let message = format!(
-                "{} {}: {}",
-                status.as_u16(),
-                value["error"]["type"].as_str().unwrap_or("http_error"),
-                value["error"]["message"].as_str().unwrap_or(&text)
-            );
-            if oauth && !self.pinned {
-                let mut current = self.version.lock().unwrap();
-                if let Some(required) = fingerprint::required_version(&message, &current) {
-                    *current = required;
-                    return Err(Failure {
-                        error: anyhow!(message),
-                        status: Some(status.as_u16()),
-                        wait: Some(Duration::ZERO),
-                        kind: Kind::Version,
-                    });
-                }
-                // Another in-flight request may already have adopted the required version.
-                if *current != version && fingerprint::required_version(&message, &version).is_some() {
-                    return Err(Failure {
-                        error: anyhow!(message),
-                        status: Some(status.as_u16()),
-                        wait: Some(Duration::ZERO),
-                        kind: Kind::Version,
-                    });
-                }
+        let response = match transport::send(self.client.post(url).headers(headers).body(bytes), progress).await {
+            Err(failure) if self.upgrade(&failure.error.to_string(), &version) => {
+                return Err(Failure { kind: Kind::Again, wait: Some(Duration::ZERO), ..failure });
             }
-            return Err(Failure {
-                error: anyhow!(message),
-                status: Some(status.as_u16()),
-                wait,
-                kind: if status.as_u16() == 429 {
-                    Kind::RateLimit
-                } else if status.is_server_error() {
-                    Kind::Retry
-                } else {
-                    Kind::Fatal
-                },
-            });
-        }
-        let mut bytes = response.bytes_stream();
-        let mut parser = Parser::default();
-        let mut stream = stream::Stream::default();
-        let mut emitted = false;
-        while let Some(chunk) = bytes.next().await {
-            let chunk = chunk
-                .map_err(|e| if emitted { Failure::fatal(e.into()) } else { Failure::retry(e.into(), None, None) })?;
-            for data in parser.feed(&chunk) {
-                let event: Value = serde_json::from_str(&data).map_err(|e| Failure::fatal(e.into()))?;
-                if event["type"] == "error" {
-                    let kind = event["error"]["type"].as_str().unwrap_or("api_error");
-                    let message = event["error"]["message"].as_str().unwrap_or("Anthropic stream error");
-                    let status = match kind {
-                        "rate_limit_error" => Some(429),
-                        "overloaded_error" => Some(529),
-                        "api_error" => Some(500),
-                        _ => None,
-                    };
-                    return Err(Failure {
-                        error: anyhow!("{kind}: {message}"),
-                        status,
-                        wait: None,
-                        kind: if emitted {
-                            Kind::Fatal
-                        } else if status == Some(429) {
-                            Kind::RateLimit
-                        } else if status.is_some() {
-                            Kind::Retry
-                        } else {
-                            Kind::Fatal
-                        },
-                    });
-                }
-                emitted |= matches!(event["type"].as_str(), Some("content_block_start" | "content_block_delta"));
-                if let Some(completion) = stream.event(event, request.model, oauth, progress).map_err(Failure::fatal)? {
-                    return Ok(completion);
-                }
+            response => response?,
+        };
+        // Once content has streamed, a failure is final: a retry would stream it again.
+        let mut streamed = false;
+        let fail =
+            |error: anyhow::Error, streamed| if streamed { Failure::fatal(error) } else { Failure::retry(error) };
+        let mut events = Events::new(response);
+        let mut stream = stream::Stream::new(request.model, oauth);
+        while let Some(data) = events.next().await {
+            let data = data.map_err(|e| fail(e.into(), streamed))?;
+            let event: Value = serde_json::from_str(&data).map_err(Failure::fatal)?;
+            if event["type"] == "error" {
+                let failure = stream_error(&event["error"]);
+                return Err(if streamed { Failure { kind: Kind::Fatal, ..failure } } else { failure });
+            }
+            streamed |= matches!(event["type"].as_str(), Some("content_block_start" | "content_block_delta"));
+            if let Some(completion) = stream.event(event, progress).map_err(Failure::fatal)? {
+                return Ok(completion);
             }
         }
-        let error = anyhow!("Anthropic stream ended before message_stop");
-        Err(if emitted { Failure::fatal(error) } else { Failure::retry(error, None, None) })
+        Err(fail(anyhow!("Anthropic stream ended before message_stop"), streamed))
+    }
+
+    fn headers(&self, request: &Request, version: &str, authorization: Authorization) -> Result<HeaderMap> {
+        let oauth = self.config.oauth();
+        let thinking = self.config.thinking != Thinking::Disabled;
+        // Only the selected credential is sent, whatever the other headers carry.
+        let mut pairs: Vec<(String, String)> = (self.config.headers.iter().chain(&authorization.headers))
+            .filter(|(key, _)| !key.eq_ignore_ascii_case("authorization") && !key.eq_ignore_ascii_case("x-api-key"))
+            .cloned()
+            .collect();
+        pairs.push(("content-type".into(), "application/json".into()));
+        pairs.push(("anthropic-version".into(), "2023-06-01".into()));
+        if oauth {
+            pairs.extend(fingerprint::headers(
+                version,
+                request.cache_key,
+                thinking || !request.tools.is_empty(),
+                thinking,
+            ));
+        } else {
+            pairs.push(("accept".into(), "text/event-stream".into()));
+            if thinking {
+                pairs.push(("anthropic-beta".into(), API_KEY_BETAS.into()));
+            }
+        }
+        let mut headers = HeaderMap::new();
+        for (key, value) in pairs {
+            headers.insert(HeaderName::from_bytes(key.as_bytes())?, HeaderValue::from_str(&value)?);
+        }
+        let (name, token) = match oauth {
+            true => ("authorization", format!("Bearer {}", authorization.token)),
+            false => ("x-api-key", authorization.token),
+        };
+        let mut credential = HeaderValue::from_str(&token)?;
+        credential.set_sensitive(true);
+        headers.insert(name, credential);
+        Ok(headers)
+    }
+
+    /// Whether a failure asks for a newer Claude Code version. The first request to see it
+    /// adopts the version; others that raced it retry with the version it adopted.
+    fn upgrade(&self, message: &str, sent: &str) -> bool {
+        if !self.upgradable {
+            return false;
+        }
+        let mut current = self.version.lock().unwrap();
+        if let Some(required) = fingerprint::required_version(message, &current) {
+            *current = required;
+            return true;
+        }
+        *current != sent && fingerprint::required_version(message, sent).is_some()
     }
 }
 
-#[derive(PartialEq)]
-enum Kind {
-    Fatal,
-    Retry,
-    RateLimit,
-    Version,
-}
-struct Failure {
-    error: anyhow::Error,
-    status: Option<u16>,
-    wait: Option<Duration>,
-    kind: Kind,
-}
-impl Failure {
-    fn fatal(error: anyhow::Error) -> Self {
-        Self { error, status: None, wait: None, kind: Kind::Fatal }
-    }
-    fn retry(error: anyhow::Error, status: Option<u16>, wait: Option<Duration>) -> Self {
-        Self { error, status, wait, kind: Kind::Retry }
+/// A stream's `error` event, retried like the HTTP status its type stands for.
+fn stream_error(error: &Value) -> Failure {
+    let kind = error["type"].as_str().unwrap_or("api_error");
+    let message = anyhow!("{kind}: {}", error["message"].as_str().unwrap_or("Anthropic stream error"));
+    match kind {
+        "rate_limit_error" => Failure::status(message, 429),
+        "overloaded_error" => Failure::status(message, 529),
+        "api_error" => Failure::status(message, 500),
+        _ => Failure::fatal(message),
     }
 }
 
@@ -288,50 +248,10 @@ impl Provider for Anthropic {
         progress: &'a (dyn Fn(Progress) + Send + Sync),
     ) -> BoxFuture<'a, Result<Completion>> {
         Box::pin(async move {
-            let mut retries = 0;
-            let mut version_retries = 0;
-            let mut backoff = Duration::from_millis(500);
-            loop {
-                let report = |hold| progress(Progress::Held(hold));
-                let permit = self.config.gate.acquire(&report).await;
-                let failure = match self.attempt(&request, progress).await {
-                    Ok(completion) => {
-                        permit.succeeded();
-                        return Ok(completion);
-                    }
-                    Err(failure) => failure,
-                };
-                let wait = failure.wait.unwrap_or(backoff);
-                if failure.kind == Kind::RateLimit {
-                    permit.rate_limited(wait);
-                } else {
-                    drop(permit);
-                }
-                if failure.kind == Kind::Fatal {
-                    return Err(failure.error);
-                }
-                if failure.kind == Kind::Version {
-                    if version_retries >= 1 {
-                        return Err(failure.error);
-                    }
-                    version_retries += 1;
-                } else {
-                    if retries >= self.config.max_retries {
-                        return Err(failure.error);
-                    }
-                    retries += 1;
-                }
-                progress(Progress::Event(ProviderEvent::Retry {
-                    attempt: retries + version_retries,
-                    status: failure.status,
-                    message: failure.error.to_string(),
-                    delay_ms: wait.as_millis() as u64,
-                }));
-                if failure.kind != Kind::RateLimit {
-                    tokio::time::sleep(wait).await;
-                }
-                backoff = (backoff * 2).min(Duration::from_secs(30));
-            }
+            transport::retrying(&self.config.gate, self.config.max_retries, progress, || {
+                self.attempt(&request, progress)
+            })
+            .await
         })
     }
 }

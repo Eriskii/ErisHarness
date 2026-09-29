@@ -73,6 +73,8 @@ pub enum Item {
     ToolCall {
         call_id: String,
         name: String,
+        /// Raw model output, possibly malformed. Validate before execution;
+        /// a rejected input is preserved alongside its error tool result.
         arguments: String,
     },
     ToolResult {
@@ -123,6 +125,11 @@ pub struct AgentRecord {
 /// Live events for observers. Text deltas are never persisted; items are.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Observation {
+    /// Provider transport diagnostics forwarded without interpreting the wire protocol.
+    Provider {
+        agent: String,
+        event: crate::provider::ProviderEvent,
+    },
     State {
         agent: String,
         state: AgentState,

@@ -1,6 +1,7 @@
 //! OpenAI Responses API, streamed. Requests are stateless (`store: false` by default): the
 //! whole transcript is sent each time, and encrypted reasoning is carried back in it.
 
+use super::http::{response_event, retry_after};
 use super::sse::Parser;
 use super::{Completion, Credentials, Progress, Provider, RateGate, Request};
 use crate::agent::{Item, Usage};
@@ -73,6 +74,7 @@ impl Responses {
         }
         let response = builder.send().await.map_err(|e| Failure::Retry(anyhow!(e), None))?;
         let status = response.status();
+        progress(Progress::Event(response_event(status.as_u16(), response.headers())));
         if !status.is_success() {
             let wait = retry_after(response.headers());
             let text = response.text().await.unwrap_or_default();
@@ -163,13 +165,6 @@ impl Provider for Responses {
             bail!("no attempts made")
         })
     }
-}
-
-fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let number = |name: &str| headers.get(name)?.to_str().ok()?.trim().parse::<f64>().ok();
-    number("retry-after-ms")
-        .map(|ms| Duration::from_secs_f64(ms / 1000.0))
-        .or_else(|| number("retry-after").map(Duration::from_secs_f64))
 }
 
 fn usage(value: &Value) -> Usage {

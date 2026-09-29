@@ -68,8 +68,63 @@ inbox (SQLite)  ──wake──▶  turn task  ──▶ provider ──▶ ite
   with a configurable endpoint and headers. `Credentials::authorize` supplies the token and
   any per-account headers for each request, so refreshable logins stay outside the harness.
   It retries 429s and 5xx, honoring `retry-after-ms` and `retry-after`.
+- **Anthropic** is a separate Messages API provider (`provider::anthropic`). It implements
+  the same `Provider` and `Credentials` traits as Responses; the runtime has no provider
+  switches. Its transport, transcript conversion, SSE decoder and Claude Code fingerprint
+  are separate modules. `AnthropicAuth::ApiKey` uses `x-api-key`;
+  `AnthropicAuth::ClaudeCode` uses subscription OAuth bearer authentication.
 - **Tools** implement `Tool`. `tools::builtin()` is Pi 0.87's `read`, `bash`, `edit`, `write`,
   with Pi's exact model-facing text, plus `send_message`.
+
+## Anthropic subscriptions
+
+```rust,no_run
+use std::sync::Arc;
+use erisharness::provider::{Anthropic, AnthropicAuth, AnthropicConfig, ClaudeCode, StaticToken, Thinking};
+
+let credentials = Arc::new(StaticToken(std::env::var("CLAUDE_CODE_OAUTH_TOKEN")?));
+let mut config = AnthropicConfig::new(credentials, AnthropicAuth::ClaudeCode(ClaudeCode {
+    install_id: "persistent-installation-id".into(),
+    account_id: None,
+    version: None,
+}));
+config.thinking = Thinking::Adaptive { display: false }; // Choose the model's capabilities.
+let provider = Arc::new(Anthropic::new(config)?);
+// Harness::builder(dir).provider("claude", provider) ...
+# Ok::<(), anyhow::Error>(())
+```
+
+The OAuth wire behavior follows oh-my-pi commit
+[`25097b1`](https://github.com/can1357/oh-my-pi/tree/25097b1be3d9b06dc38ca5e20fc7058ad5fd65f4):
+Claude Code identity and billing system blocks, first-user-message SHA-256 fingerprint,
+XXHash64 checksum of the exact serialized body, CLI/SDK headers and beta flags, stable
+device/session metadata, reversible custom-tool prefixes, one-hour cache markers and a
+64,000-token output ceiling. The fallback CLI version is 2.1.280. An explicit config version
+or `PI_AI_CLAUDE_CODE_VERSION` pins it; otherwise one server-directed version upgrade may be
+retried independently of the normal retry allowance. No 1M-context beta is advertised.
+
+Set `Thinking` explicitly for the model: `Disabled`, `Adaptive { display }`, or
+`Budget { tokens, display }`. The display field is only sent when enabled. Signed and
+redacted thinking are preserved as opaque Anthropic state in reasoning items, and replayed
+only for the same model. Tool results and images are converted to Anthropic content blocks.
+Transport failures are retried only before content begins, so streamed output is not replayed.
+Eager tool streaming can finish with malformed arguments. These remain verbatim in
+`Item::ToolCall.arguments`; the runtime validates JSON objects before tool execution and
+returns an error with the raw `INVALID_JSON` value so the model can correct the call.
+The Anthropic adapter wraps invalid arguments in an object when replaying that failed
+call. It does not repair JSON or execute partial arguments. Empty input is invalid;
+argument-free tools must send `{}`.
+
+Each provider can share a `RateGate` across agents using the same account. Response status,
+allowlisted rate-limit/retry headers, and retry attempts are exposed through
+`Progress::Event` and `Observation::Provider`; no credentials or cookies are included.
+Login, credential storage and refresh belong to the host's `Credentials` implementation.
+
+Protocol tests run without a subscription or Docker:
+
+```sh
+cargo test --lib --test anthropic --test direct --test lifecycle --test mail
+```
 
 ## Direct machines
 
@@ -106,4 +161,3 @@ cargo test          # needs Docker once, to export debian:bookworm-slim as the t
 ```
 
 The sandbox isolation tests live in ErisSandbox.
-

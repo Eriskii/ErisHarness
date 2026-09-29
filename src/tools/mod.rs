@@ -20,6 +20,14 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+/// Parse a model's tool arguments before execution. Invalid input belongs in a
+/// tool error, not a failed agent turn. Even argument-free tools must send `{}`.
+pub fn parse_arguments(arguments: &str) -> anyhow::Result<Value> {
+    let input: Value = serde_json::from_str(arguments)?;
+    anyhow::ensure!(input.is_object(), "tool arguments must be a JSON object");
+    Ok(input)
+}
+
 /// What a tool call returns to the model.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]

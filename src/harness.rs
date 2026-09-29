@@ -414,6 +414,7 @@ impl Harness {
     ) -> Result<Option<Completion>> {
         let held = AtomicBool::new(false);
         let progress = |progress: Progress| match progress {
+            Progress::Event(event) => self.observe(Observation::Provider { agent: agent.to_owned(), event }),
             Progress::Text(text) if stream => {
                 self.observe(Observation::TextDelta { agent: agent.to_owned(), text: text.to_owned() })
             }
@@ -594,10 +595,15 @@ async fn call_tool(tools: &[Arc<dyn Tool>], context: &ToolContext, name: &str, a
     let Some(tool) = tools.iter().find(|t| t.name() == name) else {
         return ToolOutput::error(format!("Tool {name} not found"));
     };
-    let args = if arguments.trim().is_empty() { Ok(serde_json::json!({})) } else { serde_json::from_str(arguments) };
-    match args {
+    match crate::tools::parse_arguments(arguments) {
         Ok(args) => tool.call(context, args).await,
-        Err(error) => ToolOutput::error(format!("Invalid JSON arguments for {name}: {error}")),
+        Err(error) => ToolOutput::error(
+            serde_json::json!({
+                "error": format!("Invalid JSON arguments for {name}: {error}. Send a corrected tool call."),
+                "INVALID_JSON": arguments,
+            })
+            .to_string(),
+        ),
     }
 }
 

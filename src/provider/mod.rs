@@ -1,10 +1,14 @@
 //! Model providers. A provider turns an agent's transcript into model output items. The
-//! harness knows nothing about wire formats; [`Responses`] speaks OpenAI's Responses API.
+//! harness knows nothing about wire formats. Register any [`Provider`] under a name with
+//! `HarnessBuilder::provider`; transport, credentials and model policy stay in the provider.
 
+pub mod anthropic;
 mod gate;
-mod responses;
+mod http;
+pub mod responses;
 mod sse;
 
+pub use anthropic::{Anthropic, AnthropicAuth, AnthropicConfig, ClaudeCode, Thinking};
 pub use gate::{Permit, RateGate};
 pub use responses::{Responses, ResponsesConfig};
 
@@ -48,6 +52,24 @@ pub enum Progress<'a> {
     Text(&'a str),
     /// The call is waiting, or with `None`, goes on after waiting.
     Held(Option<Hold>),
+    /// Transport diagnostics, independent of a provider's wire format.
+    Event(ProviderEvent),
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderEvent {
+    /// Only rate-limit, retry and request-id headers; never authentication or cookies.
+    Response {
+        status: u16,
+        headers: Vec<(String, String)>,
+    },
+    Retry {
+        attempt: u32,
+        status: Option<u16>,
+        message: String,
+        delay_ms: u64,
+    },
 }
 
 pub trait Provider: Send + Sync {

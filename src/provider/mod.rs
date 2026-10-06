@@ -18,7 +18,7 @@ pub use chat::{ChatCompletions, ChatCompletionsConfig};
 pub use gate::{Permit, RateGate};
 pub use responses::{Responses, ResponsesConfig};
 
-use crate::agent::{Item, Usage};
+use crate::agent::{Image, Item, Usage};
 use futures_util::future::BoxFuture;
 use serde_json::Value;
 
@@ -112,11 +112,19 @@ impl Credentials for StaticToken {
 /// agent's mail under a line naming it, and a compaction's summary with how to take it.
 pub fn user_text(item: &Item) -> Option<String> {
     match item {
-        Item::Input { from, text } if from == "user" => Some(text.clone()),
-        Item::Input { from, text } => Some(format!("[Message from agent {from}]\n{text}")),
+        Item::Input { from, text, .. } if from == "user" => Some(text.clone()),
+        Item::Input { from, text, .. } => Some(format!("[Message from agent {from}]\n{text}")),
         Item::Compaction { summary } => {
             Some(format!("The conversation so far was compacted. Summary:\n\n{summary}\n\nContinue from here."))
         }
         _ => None,
+    }
+}
+
+/// The images sent with an item in the user's role, which follow its text.
+pub fn user_images(item: &Item) -> &[Image] {
+    match item {
+        Item::Input { images, .. } => images,
+        _ => &[],
     }
 }

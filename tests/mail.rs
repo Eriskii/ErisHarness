@@ -4,7 +4,7 @@ mod common;
 
 use common::model::{Model, Reply, calls, says};
 use common::{direct, inputs, results, settle};
-use erisharness::agent::{AgentSpec, AgentState};
+use erisharness::agent::{AgentSpec, AgentState, Image, Item};
 use erisharness::{Harness, Recipient};
 use serde_json::json;
 use std::path::Path;
@@ -185,4 +185,29 @@ fn a_reply_claimed_by_a_wait_is_not_redelivered_after_a_restart() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(asker.requests().len(), 2, "the restarted harness woke the asker again");
     assert_eq!(inputs(&h, &a).len(), 1);
+}
+
+#[test]
+fn mail_carries_images_to_the_model_after_its_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let model = Model::start(vec![says("a pool")]);
+    let outbox = Arc::new(Outbox::default());
+    let h = harness(&temp.path().join("state"), &[("test", &model)], &outbox);
+    let agent = h.create_agent(spec(temp.path(), "test")).unwrap();
+    let image = Image { mime: "image/jpeg".into(), data: "/9j/".into() };
+    h.send_with_images(&agent, "user", "What is here?", vec![image.clone()]).unwrap();
+    settle(&h, &agent, AgentState::Idle);
+    assert_eq!(
+        model.requests()[0]["input"][0],
+        json!({"role": "user", "content": [
+            {"type": "input_text", "text": "What is here?"},
+            {"type": "input_image", "image_url": "data:image/jpeg;base64,/9j/"},
+        ]})
+    );
+    let items = common::items(&h, &agent);
+    assert!(matches!(&items[0], Item::Input { images, .. } if images == &[image]), "{:?}", items[0]);
+    assert!(
+        h.send_with_images("user", &agent, "a picture", vec![Image { mime: "image/png".into(), data: "AA".into() }])
+            .is_err()
+    );
 }

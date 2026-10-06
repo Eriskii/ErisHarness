@@ -2,7 +2,7 @@
 //! speak. Each request carries the whole visible transcript.
 
 use super::transport::{self, Events, Failure};
-use super::{Completion, Credentials, Progress, Provider, RateGate, Request, user_text};
+use super::{Completion, Credentials, Progress, Provider, RateGate, Request, user_images, user_text};
 use crate::agent::{Item, Usage};
 use crate::tools::{Content, parse_arguments};
 use anyhow::{Result, anyhow};
@@ -194,7 +194,16 @@ fn messages(request: &Request, reasoning_field: Option<&str>) -> Vec<Value> {
             messages.push(json!({"role": "user", "content": std::mem::take(&mut images)}));
         }
         if let Some(text) = user_text(item) {
-            messages.push(json!({"role": "user", "content": text}));
+            let attached = user_images(item);
+            let content = if attached.is_empty() {
+                json!(text)
+            } else {
+                let images = attached.iter().map(|i| {
+                    json!({"type": "image_url", "image_url": {"url": format!("data:{};base64,{}", i.mime, i.data)}})
+                });
+                json!(std::iter::once(json!({"type": "text", "text": text})).chain(images).collect::<Vec<_>>())
+            };
+            messages.push(json!({"role": "user", "content": content}));
             continue;
         }
         match item {

@@ -83,7 +83,7 @@ pub fn inputs(h: &Harness, agent: &str) -> Vec<(String, String)> {
     items(h, agent)
         .into_iter()
         .filter_map(|item| match item {
-            Item::Input { from, text } => Some((from, text)),
+            Item::Input { from, text, .. } => Some((from, text)),
             _ => None,
         })
         .collect()

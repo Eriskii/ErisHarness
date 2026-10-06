@@ -3,7 +3,7 @@
 //! which other agents may read through a bind mount; readers take no locks, so they cannot
 //! stall the writer.
 
-use crate::agent::{AgentRecord, AgentSpec, AgentState, Entry, Item, Usage};
+use crate::agent::{AgentRecord, AgentSpec, AgentState, Entry, Image, Item, Usage};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::fs;
@@ -22,6 +22,7 @@ pub struct Mail {
     pub id: i64,
     pub from: String,
     pub text: String,
+    pub images: Vec<Image>,
 }
 
 const SCHEMA: &str = "
@@ -45,7 +46,8 @@ CREATE TABLE IF NOT EXISTS inbox (
     sender TEXT NOT NULL,
     body TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    delivered_seq INTEGER
+    delivered_seq INTEGER,
+    images TEXT
 );
 CREATE INDEX IF NOT EXISTS inbox_pending ON inbox(agent) WHERE delivered_seq IS NULL;
 ";
@@ -75,7 +77,13 @@ fn record(row: &rusqlite::Row) -> rusqlite::Result<AgentRecord> {
 }
 
 fn mail(row: &rusqlite::Row) -> rusqlite::Result<Mail> {
-    Ok(Mail { id: row.get(0)?, from: row.get(1)?, text: row.get(2)? })
+    let images: Option<String> = row.get(3)?;
+    let images = match images {
+        Some(json) => serde_json::from_str(&json)
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, e.into()))?,
+        None => Vec::new(),
+    };
+    Ok(Mail { id: row.get(0)?, from: row.get(1)?, text: row.get(2)?, images })
 }
 
 pub fn now_ms() -> u64 {
@@ -98,6 +106,11 @@ impl Store {
             .exists([])?;
         if !counted {
             connection.execute_batch("ALTER TABLE agents ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0")?;
+        }
+        // An inbox without the images column gains it; earlier mail has none.
+        let imaged = connection.prepare("SELECT 1 FROM pragma_table_info('inbox') WHERE name = 'images'")?.exists([])?;
+        if !imaged {
+            connection.execute_batch("ALTER TABLE inbox ADD COLUMN images TEXT")?;
         }
         Ok(Self { db: Mutex::new(connection), transcripts: transcripts.to_owned() })
     }
@@ -173,7 +186,7 @@ impl Store {
     pub fn reply(&self, agent: &str, from: &str, after: i64) -> Result<Option<Mail>> {
         let db = self.db.lock().unwrap();
         let mut statement = db.prepare_cached(
-            "SELECT id, sender, body FROM inbox WHERE agent = ?1 AND sender = ?2 AND id > ?3 AND delivered_seq IS NULL
+            "SELECT id, sender, body, images FROM inbox WHERE agent = ?1 AND sender = ?2 AND id > ?3 AND delivered_seq IS NULL
              ORDER BY id LIMIT 1",
         )?;
         Ok(statement.query_row(params![agent, from, after], mail).optional()?)
@@ -189,11 +202,12 @@ impl Store {
         Ok(statement.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn enqueue(&self, agent: &str, from: &str, text: &str) -> Result<i64> {
+    pub fn enqueue(&self, agent: &str, from: &str, text: &str, images: &[Image]) -> Result<i64> {
+        let images = if images.is_empty() { None } else { Some(serde_json::to_string(images)?) };
         let db = self.db.lock().unwrap();
         db.execute(
-            "INSERT INTO inbox (agent, sender, body, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![agent, from, text, now_ms() as i64],
+            "INSERT INTO inbox (agent, sender, body, created_at, images) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![agent, from, text, now_ms() as i64, images],
         )?;
         Ok(db.last_insert_rowid())
     }
@@ -207,7 +221,7 @@ impl Store {
     pub fn pending(&self, agent: &str) -> Result<Vec<Mail>> {
         let db = self.db.lock().unwrap();
         let mut statement = db.prepare_cached(
-            "SELECT id, sender, body FROM inbox WHERE agent = ?1 AND delivered_seq IS NULL ORDER BY id",
+            "SELECT id, sender, body, images FROM inbox WHERE agent = ?1 AND delivered_seq IS NULL ORDER BY id",
         )?;
         Ok(statement.query_map([agent], mail)?.collect::<rusqlite::Result<_>>()?)
     }

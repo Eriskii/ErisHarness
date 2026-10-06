@@ -3,7 +3,7 @@
 
 use super::{AnthropicAuth, AnthropicConfig, CacheRetention, Thinking, fingerprint};
 use crate::agent::Item;
-use crate::provider::{Request, user_text};
+use crate::provider::{Request, user_images, user_text};
 use crate::tools::Content;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
@@ -30,7 +30,10 @@ pub fn body(config: &AnthropicConfig, request: &Request, version: &str) -> Resul
                         user_indices.push(index);
                     }
                 }
-                ("user", vec![json!({"type":"text","text":text})])
+                let images = user_images(item)
+                    .iter()
+                    .map(|i| json!({"type":"image","source":{"type":"base64","media_type":i.mime,"data":i.data}}));
+                ("user", std::iter::once(json!({"type":"text","text":text})).chain(images).collect())
             }
             Item::Assistant { text } if !text.is_empty() => ("assistant", vec![json!({"type":"text","text":text})]),
             Item::Reasoning { encrypted: Some(state), .. } => {

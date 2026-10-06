@@ -89,7 +89,7 @@ fn request<'a>(items: &'a [Item], tools: &'a [ToolSpec]) -> Request<'a> {
 }
 
 fn input(text: &str) -> Item {
-    Item::Input { from: "user".into(), text: text.into() }
+    Item::Input { from: "user".into(), text: text.into(), images: Vec::new() }
 }
 
 #[tokio::test]
@@ -155,7 +155,7 @@ async fn replays_a_turn_as_one_assistant_message_then_tool_messages() {
             call_id: "c2".into(),
             output: ToolOutput::new(vec![Content::Image { mime: "image/png".into(), data: "AAAA".into() }]),
         },
-        Item::Input { from: "agent-b".into(), text: "ping".into() },
+        Item::Input { from: "agent-b".into(), text: "ping".into(), images: Vec::new() },
     ];
     let server = Server::start(vec![says("ok"), says("ok")]).await;
     server.provider(Some("reasoning_content")).complete(request(&items, &[]), &|_| {}).await.unwrap();
@@ -239,4 +239,22 @@ async fn an_agent_runs_tools_through_chat_completions() {
     let record = harness.agent(&id).unwrap();
     assert_eq!((record.usage.input, record.usage.cached_input), (200, 120));
     harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn images_sent_with_mail_follow_its_text() {
+    let items = [Item::Input {
+        from: "user".into(),
+        text: "What is here?".into(),
+        images: vec![erisharness::agent::Image { mime: "image/jpeg".into(), data: "/9j/".into() }],
+    }];
+    let server = Server::start(vec![says("ok")]).await;
+    server.provider(None).complete(request(&items, &[]), &|_| {}).await.unwrap();
+    assert_eq!(
+        server.requests()[0]["messages"][1],
+        json!({"role": "user", "content": [
+            {"type": "text", "text": "What is here?"},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/"}},
+        ]})
+    );
 }

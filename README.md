@@ -56,7 +56,8 @@ is, and its token usage: input, input read from and written to the prompt cache,
 reasoning.
 
 **Mail** is the only way to make an agent act. `Harness::send(agent, from, text)` queues a
-message from `"user"` or another agent's id. An idle agent starts a turn; a busy one reads the
+message from `"user"` or another agent's id; `send_with_images` adds images, which the model
+sees after the text. An idle agent starts a turn; a busy one reads the
 message at its next tool boundary. `interrupt` stops the current turn and holds mail from
 agents until the user writes again. Agents write to each other with the `send_message` tool,
 which takes the same path.

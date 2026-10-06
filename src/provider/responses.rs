@@ -2,7 +2,7 @@
 //! the whole visible transcript is sent each time, carrying encrypted reasoning back with it.
 
 use super::transport::{self, Events, Failure};
-use super::{Completion, Credentials, Progress, Provider, RateGate, Request, user_text};
+use super::{Completion, Credentials, Progress, Provider, RateGate, Request, user_images, user_text};
 use crate::agent::{Item, Usage};
 use crate::tools::{Content, ToolOutput};
 use anyhow::{Result, anyhow};
@@ -140,7 +140,11 @@ fn output_item(item: &Value) -> Option<Item> {
 fn input_item(item: &Item) -> Option<Value> {
     Some(match item {
         Item::Input { .. } | Item::Compaction { .. } => {
-            json!({"role": "user", "content": [{"type": "input_text", "text": user_text(item)?}]})
+            let text = json!({"type": "input_text", "text": user_text(item)?});
+            let images = user_images(item)
+                .iter()
+                .map(|i| json!({"type": "input_image", "image_url": format!("data:{};base64,{}", i.mime, i.data)}));
+            json!({"role": "user", "content": std::iter::once(text).chain(images).collect::<Vec<_>>()})
         }
         Item::Assistant { text } => {
             json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]})

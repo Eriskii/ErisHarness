@@ -2,7 +2,7 @@
 //! Mail wakes it: a task loads the transcript, runs model calls and tools until nothing awaits
 //! an answer, then drops everything and exits.
 
-use crate::agent::{AgentRecord, AgentSpec, AgentState, Entry, Item, Observation};
+use crate::agent::{AgentRecord, AgentSpec, AgentState, Entry, Image, Item, Observation};
 use crate::machine::{Direct, Machine, MachineSpec};
 use crate::provider::{Completion, Progress, Provider, Request, ToolSpec};
 use crate::store::{Store, Transcript};
@@ -299,14 +299,21 @@ impl Harness {
     /// Mail to a [`Recipient`]'s name goes to it instead. The result places the mail in inbox
     /// order: replies to it come after it.
     pub fn send(self: &Arc<Self>, agent: &str, from: &str, text: &str) -> Result<i64> {
+        self.send_with_images(agent, from, text, Vec::new())
+    }
+
+    /// [`send`](Self::send) with images, which the model sees after the text. Recipients take
+    /// text only.
+    pub fn send_with_images(self: &Arc<Self>, agent: &str, from: &str, text: &str, images: Vec<Image>) -> Result<i64> {
         if let Some(recipient) = self.recipients.get(agent) {
+            anyhow::ensure!(images.is_empty(), "{agent} takes text only, not images");
             // Taken first, so a reply sent during delivery still comes after it.
             let position = self.store.last_mail()?;
             recipient.deliver(from, text)?;
             return Ok(position);
         }
         let record = self.agent(agent)?;
-        let id = self.store.enqueue(agent, from, text)?;
+        let id = self.store.enqueue(agent, from, text, &images)?;
         if let Some(waiting) = self.waiting.lock().unwrap().get(agent) {
             waiting.notify_waiters();
         }
@@ -500,7 +507,7 @@ impl Harness {
             let compacting = spec.context_window.is_some_and(|window| context_tokens * 10 > window * 8);
             let mut items: Vec<Item> = visible(&transcript).iter().map(|e| e.item.clone()).collect();
             if compacting {
-                items.push(Item::Input { from: "user".into(), text: COMPACT.into() });
+                items.push(Item::Input { from: "user".into(), text: COMPACT.into(), images: Vec::new() });
             }
             let request = Request {
                 model: &spec.model,
@@ -575,7 +582,8 @@ impl Harness {
             let seq = match present.get(&mail.id) {
                 Some(&seq) => seq,
                 None => {
-                    self.append(agent, transcript, Item::Input { from: mail.from, text: mail.text }, Some(mail.id))?
+                    let input = Item::Input { from: mail.from, text: mail.text, images: mail.images };
+                    self.append(agent, transcript, input, Some(mail.id))?
                 }
             };
             delivered.push((mail.id, seq));

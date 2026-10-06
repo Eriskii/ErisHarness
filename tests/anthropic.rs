@@ -169,7 +169,7 @@ async fn oauth_wire_checksum_headers_cache_and_tool_names() {
     let result = provider
         .complete(
             request(
-                &[Item::Input { from: "user".into(), text: "hello cch=00000 😀".into() }],
+                &[Item::Input { from: "user".into(), text: "hello cch=00000 😀".into(), images: Vec::new() }],
                 &[ToolSpec { name: "_read".into(), description: "Read".into(), parameters: json!({"type":"object"}) }],
             ),
             &|p| {
@@ -219,7 +219,10 @@ async fn api_key_requests_have_no_oauth_identity() {
     let server = Server::new(vec![says()]).await;
     let provider = Anthropic::new(server.config(false)).unwrap();
     provider
-        .complete(request(&[Item::Input { from: "user".into(), text: "hello".into() }], &[]), &|_| {})
+        .complete(
+            request(&[Item::Input { from: "user".into(), text: "hello".into(), images: Vec::new() }], &[]),
+            &|_| {},
+        )
         .await
         .unwrap();
     let script = server.script.lock().unwrap();
@@ -356,11 +359,14 @@ async fn retries_rate_limits_and_reads_credentials_again() {
     let provider = Anthropic::new(server.config(true)).unwrap();
     let seen = Mutex::new(Vec::new());
     provider
-        .complete(request(&[Item::Input { from: "user".into(), text: "hello".into() }], &[]), &|p| {
-            if let Progress::Event(e) = p {
-                seen.lock().unwrap().push(e);
-            }
-        })
+        .complete(
+            request(&[Item::Input { from: "user".into(), text: "hello".into(), images: Vec::new() }], &[]),
+            &|p| {
+                if let Progress::Event(e) = p {
+                    seen.lock().unwrap().push(e);
+                }
+            },
+        )
         .await
         .unwrap();
     assert_eq!(server.script.lock().unwrap().requests.len(), 2);
@@ -385,7 +391,10 @@ async fn version_upgrade_rebuilds_header_and_attestation_with_zero_normal_retrie
     config.max_retries = 0;
     let provider = Anthropic::new(config).unwrap();
     provider
-        .complete(request(&[Item::Input { from: "user".into(), text: "hello".into() }], &[]), &|_| {})
+        .complete(
+            request(&[Item::Input { from: "user".into(), text: "hello".into(), images: Vec::new() }], &[]),
+            &|_| {},
+        )
         .await
         .unwrap();
     let script = server.script.lock().unwrap();
@@ -402,7 +411,10 @@ async fn truncated_stream_is_not_replayed_after_content() {
     let server = Server::new(vec![reply, says()]).await;
     let provider = Anthropic::new(server.config(true)).unwrap();
     let error = provider
-        .complete(request(&[Item::Input { from: "user".into(), text: "hello".into() }], &[]), &|_| {})
+        .complete(
+            request(&[Item::Input { from: "user".into(), text: "hello".into(), images: Vec::new() }], &[]),
+            &|_| {},
+        )
         .await
         .err()
         .unwrap();
@@ -416,7 +428,7 @@ async fn agent_mail_and_compactions_read_as_they_do_on_every_provider() {
     let provider = Anthropic::new(server.config(false)).unwrap();
     let items = [
         Item::Compaction { summary: "Earlier work.".into() },
-        Item::Input { from: "agent-b".into(), text: "hi".into() },
+        Item::Input { from: "agent-b".into(), text: "hi".into(), images: Vec::new() },
     ];
     provider.complete(request(&items, &[]), &|_| {}).await.unwrap();
     let body: Value = serde_json::from_str(&server.script.lock().unwrap().requests[0].1).unwrap();
@@ -429,4 +441,21 @@ async fn agent_mail_and_compactions_read_as_they_do_on_every_provider() {
             "[Message from agent agent-b]\nhi"
         ]
     );
+}
+
+#[tokio::test]
+async fn images_sent_with_mail_follow_its_text() {
+    let server = Server::new(vec![says()]).await;
+    let provider = Anthropic::new(server.config(false)).unwrap();
+    let items = [Item::Input {
+        from: "user".into(),
+        text: "What is here?".into(),
+        images: vec![erisharness::agent::Image { mime: "image/jpeg".into(), data: "/9j/".into() }],
+    }];
+    provider.complete(request(&items, &[]), &|_| {}).await.unwrap();
+    let body: Value = serde_json::from_str(&server.script.lock().unwrap().requests[0].1).unwrap();
+    let content = &body["messages"][0]["content"];
+    assert_eq!(content[0]["text"], "What is here?");
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"], json!({"type":"base64","media_type":"image/jpeg","data":"/9j/"}));
 }

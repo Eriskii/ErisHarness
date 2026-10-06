@@ -61,10 +61,13 @@ impl AgentState {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Item {
-    /// A message delivered to the agent: from `"user"` or from another agent's id.
+    /// A message delivered to the agent: from `"user"` or from another agent's id, with any
+    /// images sent along.
     Input {
         from: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<Image>,
     },
     Assistant {
         text: String,
@@ -91,6 +94,13 @@ pub enum Item {
     Compaction {
         summary: String,
     },
+}
+
+/// An image sent with mail: base64 data and its media type, such as `image/png`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Image {
+    pub mime: String,
+    pub data: String,
 }
 
 /// A transcript line: one JSON object per line of `transcript.jsonl`.

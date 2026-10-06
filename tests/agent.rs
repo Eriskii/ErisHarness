@@ -59,7 +59,7 @@ fn a_turn_runs_tools_until_the_model_answers(f: &Fixture) {
     let items = items(&h, &agent);
     assert!(
         matches!(&items[..], [
-            Item::Input { from, text },
+            Item::Input { from, text, .. },
             Item::ToolCall { call_id, name, .. },
             Item::ToolResult { .. },
             Item::Assistant { text: answer },

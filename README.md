@@ -108,7 +108,7 @@ other's transcripts, bind the `transcripts` directory into their sandboxes.
 ## Providers
 
 A `Provider` turns a request (model, system prompt, tools, visible items) into the model's
-next items. The runtime knows no wire format. Two providers are built in, and they share:
+next items. The runtime knows no wire format. Three providers are built in, and they share:
 
 - `Credentials`, asked for a token before every request, so the host owns login and refresh.
 - A `RateGate` per account, shared by every provider using it. Calls wait for one of its
@@ -123,6 +123,16 @@ next items. The runtime knows no wire format. Two providers are built in, and th
 **Responses** speaks the OpenAI Responses API, streamed, at any endpoint with extra headers.
 It sends the whole visible transcript with `store: false`, carries encrypted reasoning
 forward, and uses the agent id as `prompt_cache_key`.
+
+**ChatCompletions** speaks OpenAI-compatible Chat Completions, streamed, at any endpoint:
+the format of most gateways and open-model hosts. A model turn's reasoning, text and tool calls
+travel as one assistant message. Models that need their reasoning back on later turns name the
+field for it in `reasoning_field` (`reasoning_content` for DeepSeek, Kimi, GLM and others).
+
+A service speaking these formats needs no provider of its own, only an endpoint, a model and a
+key. OpenCode Go, for one, serves each model in one of the three formats from
+`https://opencode.ai/zen/go/v1`: register the provider for the model's format with that
+endpoint, and name the model's slug in the agent's spec.
 
 **Anthropic** speaks the Messages API. `AnthropicAuth::ApiKey` sends the token as
 `x-api-key`. `AnthropicAuth::ClaudeCode` uses a Claude subscription's OAuth token and makes
@@ -190,7 +200,7 @@ The sandbox tests (`agent`, `tools`) export `debian:bookworm-slim` from Docker o
 need no Docker, account or subscription:
 
 ```sh
-cargo test --lib --test anthropic --test direct --test lifecycle --test mail
+cargo test --lib --test anthropic --test chat --test direct --test lifecycle --test mail
 cargo test --doc
 ```
 

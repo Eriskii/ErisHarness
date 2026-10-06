@@ -2,15 +2,19 @@
 //! the harness knows nothing about wire formats. Transport, credentials and model policy all
 //! stay inside the provider.
 //!
-//! Two are built in: [`Responses`] for the OpenAI Responses API and [`Anthropic`] for the
-//! Anthropic Messages API, by API key or Claude subscription.
+//! Three are built in: [`Responses`] for the OpenAI Responses API, [`ChatCompletions`] for
+//! OpenAI-compatible Chat Completions, and [`Anthropic`] for the Anthropic Messages API, by API
+//! key or Claude subscription. Each takes an endpoint and credentials, so any service speaking
+//! one of these formats, such as OpenCode Go, needs no provider of its own.
 
 pub mod anthropic;
+mod chat;
 mod gate;
 pub mod responses;
 mod transport;
 
 pub use anthropic::{Anthropic, AnthropicAuth, AnthropicConfig, CacheRetention, ClaudeCode, Thinking};
+pub use chat::{ChatCompletions, ChatCompletionsConfig};
 pub use gate::{Permit, RateGate};
 pub use responses::{Responses, ResponsesConfig};
 
@@ -43,6 +47,7 @@ pub struct ToolSpec {
     pub parameters: Value,
 }
 
+#[derive(Debug)]
 pub struct Completion {
     pub items: Vec<Item>,
     pub usage: Usage,

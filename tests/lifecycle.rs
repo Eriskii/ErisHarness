@@ -246,6 +246,55 @@ fn removing_an_agent_stops_it_and_deletes_its_state() {
 }
 
 #[test]
+fn reading_a_transcript_changes_nothing_on_disk() {
+    let temp = tempfile::tempdir().unwrap();
+    let model = Model::start(vec![]);
+    let h = harness(&temp.path().join("state"), &model);
+    let agent = h.create_agent(spec(temp.path())).unwrap();
+    assert!(h.transcript(&agent).unwrap().is_empty());
+    assert!(!h.transcript_path(&agent).exists(), "a read creates no transcript");
+    assert!(h.transcript("no-such-agent").is_err());
+}
+
+/// Hosts read transcripts and mail agents at any moment, also while one is being removed. The
+/// removal still succeeds, leaves nothing on disk, and no turn starts for the removed agent.
+#[test]
+fn removing_agents_while_others_read_and_mail_them_always_completes() {
+    let temp = tempfile::tempdir().unwrap();
+    let model = Model::start(vec![]);
+    let h = harness(&temp.path().join("state"), &model);
+    for round in 0..40 {
+        model.push(calls(&format!("c{round}"), "bash", json!({"command": "sleep 30"})));
+        let agent = h.create_agent(spec(temp.path())).unwrap();
+        h.send(&agent, "user", "sleep").unwrap();
+        settle(&h, &agent, AgentState::Running);
+        let asked = model.requests().len();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let busy: Vec<_> = (0..2)
+            .map(|n| {
+                let (h, agent, done) = (h.clone(), agent.clone(), done.clone());
+                std::thread::spawn(move || {
+                    while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = if n == 0 {
+                            h.transcript(&agent).map(drop)
+                        } else {
+                            h.send(&agent, "peer", "hi").map(drop)
+                        };
+                    }
+                })
+            })
+            .collect();
+        let removed = block_on(async { tokio::time::timeout(Duration::from_secs(10), h.remove_agent(&agent)).await });
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        busy.into_iter().for_each(|t| t.join().unwrap());
+        removed.unwrap().unwrap_or_else(|e| panic!("round {round}: {e:#}"));
+        assert!(!h.transcript_path(&agent).parent().unwrap().exists(), "round {round}");
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(model.requests().len(), asked, "round {round}: a removed agent started a turn");
+    }
+}
+
+#[test]
 fn agents_are_listed_with_the_metadata_their_host_gave_them() {
     let temp = tempfile::tempdir().unwrap();
     let h = harness(&temp.path().join("state"), &Model::start(vec![]));

@@ -19,6 +19,7 @@ fn main() {
         a_turn_runs_tools_until_the_model_answers,
         assistant_text_streams_to_observers,
         mail_arriving_mid_turn_is_delivered_at_a_tool_boundary,
+        mail_arriving_during_a_batch_of_calls_skips_the_rest,
         agents_message_each_other,
         send_message_tool_queues_mail_for_another_agent,
         send_message_respects_held_recipients,
@@ -118,6 +119,35 @@ fn mail_arriving_mid_turn_is_delivered_at_a_tool_boundary(f: &Fixture) {
     let requests = model.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[1]["input"].as_array().unwrap().last().unwrap(), &user_text("also check the logs"));
+}
+
+fn mail_arriving_during_a_batch_of_calls_skips_the_rest(f: &Fixture) {
+    let call = |id: &str, command: &str| {
+        json!({"type": "response.output_item.done", "item": {"type": "function_call", "call_id": id,
+            "name": "bash", "arguments": json!({"command": command}).to_string()}})
+    };
+    let batch = Reply::Events(vec![
+        call("c1", "sleep 1; echo first"),
+        call("c2", "echo second"),
+        call("c3", "echo third"),
+        completed(),
+    ]);
+    let model = Model::start(vec![batch, says("Stopping to read the message.")]);
+    let h = harness(f, &f.host_dir("batch"), &[("test", &model)]);
+    let agent = h.create_agent(spec(f)).unwrap();
+    h.send(&agent, "user", "start").unwrap();
+    settle(&h, &agent, AgentState::Running);
+    std::thread::sleep(Duration::from_millis(400));
+    h.send(&agent, "user", "stop, do this instead").unwrap();
+    settle(&h, &agent, AgentState::Idle);
+    let outputs: Vec<(bool, String)> = results(&h, &agent);
+    assert!(outputs[0].1.contains("first") && !outputs[0].0, "the running call finishes: {outputs:?}");
+    for (error, text) in &outputs[1..] {
+        assert!(*error && text.contains("a new message arrived"), "the rest are not run: {outputs:?}");
+    }
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1]["input"].as_array().unwrap().last().unwrap(), &user_text("stop, do this instead"));
 }
 
 fn agents_message_each_other(f: &Fixture) {

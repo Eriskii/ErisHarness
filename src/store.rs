@@ -241,9 +241,38 @@ impl Store {
         self.transcripts.join(agent).join("transcript.jsonl")
     }
 
+    /// The agent's transcript, opened for its turn to append to.
     pub fn transcript(&self, agent: &str) -> Result<Transcript> {
         Transcript::open(self.transcript_path(agent))
     }
+
+    /// The agent's entries so far, read without creating or changing anything: a host may read
+    /// while the agent is being removed. A transcript not yet written has none.
+    pub fn entries(&self, agent: &str) -> Result<Vec<Entry>> {
+        match fs::File::open(self.transcript_path(agent)) {
+            Ok(file) => Ok(read_entries(&file)?.0),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+/// The intact entries at the start of a transcript, and how many bytes they take. A crash
+/// mid-append leaves a partial last line, which is not an entry.
+fn read_entries(file: &fs::File) -> Result<(Vec<Entry>, u64)> {
+    let mut entries = Vec::new();
+    let mut intact = 0u64;
+    for line in BufReader::new(file).split(b'\n') {
+        let line = line?;
+        match serde_json::from_slice::<Entry>(&line) {
+            Ok(entry) => {
+                entries.push(entry);
+                intact += line.len() as u64 + 1;
+            }
+            Err(_) => break,
+        }
+    }
+    Ok((entries, intact))
 }
 
 /// An open transcript: its entries, and the file for appending more.
@@ -255,24 +284,9 @@ pub struct Transcript {
 impl Transcript {
     fn open(path: PathBuf) -> Result<Self> {
         let file = fs::OpenOptions::new().create(true).read(true).append(true).open(&path)?;
-        let mut entries = Vec::new();
-        let mut intact = 0u64;
-        let mut torn = false;
-        for line in BufReader::new(&file).split(b'\n') {
-            let line = line?;
-            match serde_json::from_slice::<Entry>(&line) {
-                Ok(entry) => {
-                    entries.push(entry);
-                    intact += line.len() as u64 + 1;
-                }
-                Err(_) => {
-                    torn = true;
-                    break;
-                }
-            }
-        }
-        // A crash mid-append leaves a partial last line. Drop it so the next append starts clean.
-        if torn {
+        let (entries, intact) = read_entries(&file)?;
+        // Drop a partial last line so the next append starts clean.
+        if file.metadata()?.len() > intact {
             file.set_len(intact)?;
         }
         Ok(Self { entries, file })

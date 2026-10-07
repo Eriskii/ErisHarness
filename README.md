@@ -50,7 +50,9 @@ Harness::send ──▶ inbox (SQLite) ──wake──▶ turn ──▶ provid
 system prompt, machine, and `metadata` the host keeps with the agent and the harness never
 reads. The transcript at `transcripts/<id>/transcript.jsonl` holds every finished item, one
 JSON line each. `agents` lists every agent, `update_agent` changes a spec for the next turn,
-and `remove_agent` stops an agent and deletes its record, mail, transcript and sandbox. An
+and `remove_agent` stops an agent and deletes its record, mail, transcript and sandbox. From
+the moment a removal starts, the agent refuses mail and starts no turn. Reading a transcript
+never writes, so hosts may read one while its agent is removed. An
 `AgentRecord` shows its state (idle, running, or failed with the error), how full its context
 is, and its token usage: input, input read from and written to the prompt cache, output, and
 reasoning.
@@ -58,13 +60,15 @@ reasoning.
 **Mail** is the only way to make an agent act. `Harness::send(agent, from, text)` queues a
 message from `"user"` or another agent's id; `send_with_images` adds images, which the model
 sees after the text. An idle agent starts a turn; a busy one reads the
-message at its next tool boundary. `interrupt` stops the current turn and holds mail from
+message at its next tool boundary: once the running call finishes, the rest of that reply's calls
+are not run, and the model reads the message first. `interrupt` stops the current turn and holds mail from
 agents until the user writes again. Agents write to each other with the `send_message` tool,
 which takes the same path.
 
 **Waiting for a reply.** `send_message` with `wait` blocks until the recipient's next message
-to the sender, which becomes the call's result instead of arriving as mail. `timeout_seconds`
-or an interrupt ends the wait early, and the reply then arrives as mail. A reply is marked
+to the sender, which becomes the call's result instead of arriving as mail. A wait ends early
+after `timeout_seconds` (30 seconds for an agent when it is omitted; the user has no limit) or
+an interrupt, and the reply then arrives as mail. A reply is marked
 delivered only once its result is in the transcript, so a crash neither loses nor repeats it.
 
 **Recipients** are names outside the harness, such as the user, registered with
@@ -83,7 +87,8 @@ follows it; the transcript keeps everything. A reply without a summary leaves th
 whole.
 
 **Observers** `subscribe` to live events: state changes, finished items, streamed text, each
-model call's token usage, calls held by rate limits, and provider diagnostics. Streamed text
+model call's token usage, calls held by rate limits, mail as it is sent, and provider
+diagnostics. Streamed text
 is never stored.
 
 ## Machines

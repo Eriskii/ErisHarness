@@ -17,10 +17,11 @@ pub struct RateGate {
     state: Mutex<State>,
     /// When the pause after the latest rate limit ends.
     pause: watch::Sender<Option<Instant>>,
-    max: usize,
 }
 
 struct State {
+    /// The most slots successes grow to.
+    max: usize,
     limit: f64,
     /// Slots calls may hold: floor(limit), at most `max`.
     capacity: usize,
@@ -34,10 +35,27 @@ impl RateGate {
         let initial = initial.clamp(1, max);
         Arc::new(Self {
             slots: Arc::new(Semaphore::new(initial)),
-            state: Mutex::new(State { limit: initial as f64, capacity: initial, debt: 0 }),
+            state: Mutex::new(State { max, limit: initial as f64, capacity: initial, debt: 0 }),
             pause: watch::channel(None).0,
-            max,
         })
+    }
+
+    /// From now on, `slots` calls run at once, and successes grow it no further. Calls waiting
+    /// for a larger size go on at once; over a smaller one, running calls finish first.
+    pub fn resize(&self, slots: usize) {
+        let slots = slots.max(1);
+        let mut state = self.state.lock().unwrap();
+        if slots > state.capacity {
+            let added = slots - state.capacity;
+            let repaid = added.min(state.debt);
+            state.debt -= repaid;
+            self.slots.add_permits(added - repaid);
+        } else {
+            let excess = state.capacity - slots;
+            let retired = self.slots.forget_permits(excess);
+            state.debt += excess - retired;
+        }
+        *state = State { max: slots, limit: slots as f64, capacity: slots, debt: state.debt };
     }
 
     /// How many calls may run at once.
@@ -89,7 +107,7 @@ impl RateGate {
 
     fn succeeded(&self) {
         let mut state = self.state.lock().unwrap();
-        state.limit = (state.limit + 1.0 / state.limit).min(self.max as f64);
+        state.limit = (state.limit + 1.0 / state.limit).min(state.max as f64);
         while state.capacity < state.limit as usize {
             if state.debt > 0 {
                 state.debt -= 1;
@@ -265,6 +283,37 @@ mod tests {
             gate.acquire(report).await.rate_limited(Duration::from_secs(1));
         }
         assert_eq!(gate.slots(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resize_takes_effect_at_once_and_caps_growth() {
+        let gate = RateGate::new(1, 1);
+        let (seen, report) = reports();
+        let first = gate.acquire(&report).await;
+        let acquire = || {
+            let (gate, report) = (gate.clone(), report.clone());
+            tokio::spawn(async move { gate.acquire(&report).await })
+        };
+        let second = acquire();
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished(), "one slot is taken");
+        gate.resize(2);
+        let second = second.await.unwrap();
+        assert_eq!(gate.slots(), 2);
+        gate.resize(1);
+        assert_eq!(gate.slots(), 1);
+        let third = acquire();
+        tokio::task::yield_now().await;
+        drop(first);
+        tokio::task::yield_now().await;
+        assert!(!third.is_finished(), "a call over the smaller size gives its slot up");
+        drop(second);
+        third.await.unwrap().succeeded();
+        for _ in 0..10 {
+            gate.acquire(&report).await.succeeded();
+        }
+        assert_eq!(gate.slots(), 1, "successes never grow past the size");
+        assert_eq!(*seen.lock().unwrap(), ["queued", "free", "queued", "free"]);
     }
 
     #[tokio::test(start_paused = true)]

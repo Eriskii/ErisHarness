@@ -10,6 +10,16 @@ use serde_json::{Value, json};
 
 pub struct SendMessage;
 
+/// How long a wait for another agent lasts when the call sets no limit.
+const AGENT_WAIT_SECONDS: f64 = 30.0;
+
+/// The longest wait for a reply: the call's `timeout_seconds`, or for an agent, 30 seconds.
+/// The user has no limit.
+fn wait_limit(to: &str, args: &Value) -> Option<f64> {
+    (args.get("timeout_seconds").and_then(Value::as_f64).filter(|s| *s > 0.0))
+        .or((to != "user").then_some(AGENT_WAIT_SECONDS))
+}
+
 fn describe(to: &str) -> String {
     if to == "user" { "the user".into() } else { format!("agent {to}") }
 }
@@ -20,7 +30,7 @@ impl Tool for SendMessage {
     }
 
     fn description(&self) -> String {
-        "Send a message to another agent by id, or to \"user\". It is queued: an idle agent starts working on it, a busy agent receives it at its next tool call boundary. Replies arrive as messages. Set wait to block until the recipient replies; the reply is then this call's result. timeout_seconds limits the wait, after which a reply arrives as a message instead.".into()
+        "Send a message to another agent by id, or to \"user\". It is queued: an idle agent starts working on it, a busy agent receives it at its next tool call boundary. Replies arrive as messages. Set wait to block until the recipient replies; the reply is then this call's result. timeout_seconds limits the wait (30 seconds for an agent when omitted; none for the user), after which a reply arrives as a message instead.".into()
     }
 
     fn parameters(&self) -> Value {
@@ -30,7 +40,7 @@ impl Tool for SendMessage {
                 "agent": {"type": "string", "description": "Id of the receiving agent, or \"user\""},
                 "text": {"type": "string", "description": "Message text"},
                 "wait": {"type": "boolean", "description": "Wait for the recipient's reply (default false)"},
-                "timeout_seconds": {"type": "number", "description": "Longest wait for a reply; no limit when omitted"}
+                "timeout_seconds": {"type": "number", "description": "Longest wait for a reply; when omitted, 30 seconds for an agent and no limit for the user"}
             },
             "required": ["agent", "text"]
         })
@@ -60,7 +70,7 @@ impl Tool for SendMessage {
                     format!("Message queued for agent {to}.")
                 });
             }
-            let timeout = args.get("timeout_seconds").and_then(Value::as_f64).filter(|s| *s > 0.0);
+            let timeout = wait_limit(to, &args);
             tokio::select! {
                 reply = context.mailbox.reply(&context.agent, to, sent) => match reply {
                     Ok(reply) => {
@@ -84,5 +94,19 @@ impl Tool for SendMessage {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn waits_for_agents_end_after_thirty_seconds_unless_the_call_says_otherwise() {
+        assert_eq!(wait_limit("agent-b", &json!({})), Some(30.0));
+        assert_eq!(wait_limit("agent-b", &json!({"timeout_seconds": 5})), Some(5.0));
+        assert_eq!(wait_limit("agent-b", &json!({"timeout_seconds": 0})), Some(30.0));
+        assert_eq!(wait_limit("user", &json!({})), None, "the user takes as long as they need");
+        assert_eq!(wait_limit("user", &json!({"timeout_seconds": 60})), Some(60.0));
     }
 }

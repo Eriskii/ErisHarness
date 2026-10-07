@@ -179,4 +179,10 @@ pub enum Observation {
         agent: String,
         hold: Option<crate::provider::Hold>,
     },
+    /// Mail was sent: queued for an agent, or delivered to a recipient. `from` is `"user"`,
+    /// another sender the host names, or an agent's id; `to` is an agent's id or a recipient.
+    Mail {
+        from: String,
+        to: String,
+    },
 }

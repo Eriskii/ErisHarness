@@ -115,6 +115,7 @@ impl HarnessBuilder {
             waiting: Mutex::default(),
             turns: Arc::new(Semaphore::new(self.max_turns)),
             running: Mutex::default(),
+            removing: Mutex::default(),
             observations,
             closing: CancellationToken::new(),
             runtime: tokio::runtime::Handle::current(),
@@ -146,11 +147,22 @@ pub struct Harness {
     /// Slots for turns running at once.
     turns: Arc<Semaphore>,
     running: Mutex<HashMap<String, Run>>,
+    /// Agents being removed: they take no mail and start no turn.
+    removing: Mutex<HashSet<String>>,
     observations: broadcast::Sender<Observation>,
     closing: CancellationToken,
     /// Captured at open so agents can be woken from any thread.
     runtime: tokio::runtime::Handle,
     mailbox: Arc<dyn Mailbox>,
+}
+
+/// Marks an agent as being removed until the removal ends, however it ends.
+struct Removing<'a>(&'a Harness, &'a str);
+
+impl Drop for Removing<'_> {
+    fn drop(&mut self) {
+        self.0.removing.lock().unwrap().remove(self.1);
+    }
 }
 
 /// Tools send mail through the same path as [`Harness::send`], so queueing is identical.
@@ -189,6 +201,8 @@ enum Ended {
 
 const INTERRUPTED_CALL: &str = "Tool call was interrupted before it finished.";
 const SKIPPED_CALL: &str = "Tool call skipped: the turn was interrupted.";
+const SKIPPED_FOR_MAIL: &str =
+    "Tool call not run: a new message arrived first. Read it, then call again if this is still needed.";
 const COMPACT: &str = "Your context is nearly full, so this conversation will be replaced by a summary you write now. \
 Write that summary for yourself: the task and who gave it, what has been done, the current state, key facts, \
 file paths, decisions and their reasons, open questions, and what remains to do. Include everything needed to \
@@ -248,10 +262,15 @@ impl Harness {
     /// Stops the agent and deletes its record, mail, transcript and sandbox.
     pub async fn remove_agent(&self, id: &str) -> Result<()> {
         self.agent(id)?;
-        let task = self.running.lock().unwrap().get_mut(id).and_then(|run| {
-            run.cancel.cancel();
-            run.task.take()
-        });
+        let task = {
+            let mut running = self.running.lock().unwrap();
+            self.removing.lock().unwrap().insert(id.to_owned());
+            running.get_mut(id).and_then(|run| {
+                run.cancel.cancel();
+                run.task.take()
+            })
+        };
+        let _removing = Removing(self, id);
         if let Some(task) = task {
             let _ = task.await;
         }
@@ -274,7 +293,8 @@ impl Harness {
 
     /// Everything the agent has seen and done, including what compaction hides from the model.
     pub fn transcript(&self, id: &str) -> Result<Vec<Entry>> {
-        Ok(self.store.transcript(id)?.entries)
+        self.agent(id)?;
+        self.store.entries(id)
     }
 
     /// The agent's `transcript.jsonl`, one [`Entry`] per line.
@@ -310,10 +330,13 @@ impl Harness {
             // Taken first, so a reply sent during delivery still comes after it.
             let position = self.store.last_mail()?;
             recipient.deliver(from, text)?;
+            self.observe(Observation::Mail { from: from.to_owned(), to: agent.to_owned() });
             return Ok(position);
         }
         let record = self.agent(agent)?;
+        anyhow::ensure!(!self.removing.lock().unwrap().contains(agent), "agent {agent} is being removed");
         let id = self.store.enqueue(agent, from, text, &images)?;
+        self.observe(Observation::Mail { from: from.to_owned(), to: agent.to_owned() });
         if let Some(waiting) = self.waiting.lock().unwrap().get(agent) {
             waiting.notify_waiters();
         }
@@ -395,7 +418,7 @@ impl Harness {
             return;
         }
         let mut running = self.running.lock().unwrap();
-        if running.contains_key(agent) {
+        if running.contains_key(agent) || self.removing.lock().unwrap().contains(agent) {
             return;
         }
         let cancel = self.closing.child_token();
@@ -546,11 +569,18 @@ impl Harness {
             for item in completion.items {
                 self.append(agent, &mut transcript, item, None)?;
             }
+            // Mail is read at the next tool boundary: once it arrives, the batch's remaining calls
+            // are not run, and the model sees the mail before deciding what to do next.
+            let mut mail_arrived = false;
             for (call_id, name, arguments) in calls {
                 let output = if cancel.is_cancelled() {
                     ToolOutput::error(SKIPPED_CALL)
+                } else if mail_arrived {
+                    ToolOutput::error(SKIPPED_FOR_MAIL)
                 } else {
-                    call_tool(&tools, &context, &name, &arguments).await
+                    let output = call_tool(&tools, &context, &name, &arguments).await;
+                    mail_arrived = self.store.pending(agent).is_ok_and(|p| !p.is_empty());
+                    output
                 };
                 let delivers = output.delivers;
                 let seq = self.append(agent, &mut transcript, Item::ToolResult { call_id, output }, delivers)?;

@@ -2361,9 +2361,9 @@ dependencies = [
 ]
 
 [[patch.unused]]
-name = "erisforge"
-version = "0.1.0"
+name = "erislogin"
+version = "0.4.1"
 
 [[patch.unused]]
-name = "erisauth"
-version = "0.2.0"
+name = "erisforge"
+version = "0.1.0"

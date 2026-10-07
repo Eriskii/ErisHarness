@@ -4,7 +4,7 @@ mod common;
 
 use common::model::{Model, Reply, calls, says};
 use common::{direct, inputs, results, settle};
-use erisharness::agent::{AgentSpec, AgentState, Image, Item};
+use erisharness::agent::{AgentSpec, AgentState, Image, Item, Observation};
 use erisharness::{Harness, Recipient};
 use serde_json::json;
 use std::path::Path;
@@ -49,6 +49,39 @@ fn a_waiting_send_returns_the_recipients_reply() {
     let second = &asker.requests()[1]["input"];
     assert_eq!(second[2]["output"], json!(format!("Reply from agent {b}:\n42")), "{second}");
     assert_eq!(results(&h, &b), [(false, format!("Message queued for agent {a}."))]);
+}
+
+#[test]
+fn observers_see_each_mail_as_it_is_sent() {
+    let temp = tempfile::tempdir().unwrap();
+    let (asker, answerer) = (Model::start(vec![]), Model::start(vec![]));
+    let outbox = Arc::new(Outbox::default());
+    let h = harness(&temp.path().join("state"), &[("a", &asker), ("b", &answerer)], &outbox);
+    let b = h.create_agent(spec(temp.path(), "b")).unwrap();
+    let a = h.create_agent(spec(temp.path(), "a")).unwrap();
+    asker.push(calls("m1", "send_message", json!({"agent": b, "text": "ping"})));
+    asker.push(says("asked"));
+    answerer.push(calls("r1", "send_message", json!({"agent": a, "text": "pong"})));
+    answerer.push(calls("r2", "send_message", json!({"agent": "user", "text": "told a"})));
+    answerer.push(says("answered"));
+    asker.push(says("heard"));
+    let mut observations = h.subscribe();
+    h.send(&a, "user", "ping b").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while outbox.0.lock().unwrap().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "b never wrote to the user");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    settle(&h, &b, AgentState::Idle);
+    settle(&h, &a, AgentState::Idle);
+    let mut mail = Vec::new();
+    while let Ok(observation) = observations.try_recv() {
+        if let Observation::Mail { from, to } = observation {
+            mail.push((from, to));
+        }
+    }
+    let pair = |from: &str, to: &str| (from.to_owned(), to.to_owned());
+    assert_eq!(mail, [pair("user", &a), pair(&a, &b), pair(&b, &a), pair(&b, "user")]);
 }
 
 #[test]

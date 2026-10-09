@@ -191,8 +191,9 @@ Costs stay flat from 1,000 to 3,000 live sandboxes and from 500 to 2,000 concurr
 
 ## Requirements
 
-Direct agents need Linux and `bash`. Sandboxed agents need what
-[ErisSandbox needs](https://github.com/Eriskii/ErisSandbox#requirements).
+Direct agents need a Unix system, Linux or macOS, and `bash`. Sandboxed agents need Linux and
+what [ErisSandbox needs](https://github.com/Eriskii/ErisSandbox#requirements); elsewhere
+`MachineSpec::Sandbox` and `HarnessBuilder::sandboxes` do not exist.
 
 ## Testing
 
@@ -202,8 +203,9 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The sandbox tests (`agent`, `tools`) export `debian:bookworm-slim` from Docker once. The rest
-need no Docker, account or subscription:
+The sandbox tests (`agent`, `tools`) and the `scale` example run on Linux only, and export
+`debian:bookworm-slim` from Docker once. The rest need no Docker, account or subscription, and
+run on macOS too:
 
 ```sh
 cargo test --lib --test anthropic --test chat --test direct --test lifecycle --test mail

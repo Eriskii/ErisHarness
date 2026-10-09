@@ -8,6 +8,7 @@ use crate::provider::{Completion, Progress, Provider, Request, ToolSpec};
 use crate::store::{Store, Transcript};
 use crate::tools::{Mailbox, Reply, Tool, ToolContext, ToolOutput};
 use anyhow::{Context, Result, bail};
+#[cfg(target_os = "linux")]
 use erissandbox::{Host, Sandboxes};
 use futures_util::future::BoxFuture;
 use std::collections::{HashMap, HashSet};
@@ -20,14 +21,17 @@ use tokio_util::sync::CancellationToken;
 
 /// Configures a [`Harness`]; start one with [`Harness::builder`].
 pub struct HarnessBuilder {
+    #[cfg(target_os = "linux")]
     host: Option<Host>,
     dir: PathBuf,
     transcripts: Option<PathBuf>,
+    #[cfg(target_os = "linux")]
     sandbox_dir: Option<PathBuf>,
     providers: HashMap<String, Arc<dyn Provider>>,
     tools: HashMap<String, Arc<dyn Tool>>,
     recipients: HashMap<String, Arc<dyn Recipient>>,
     max_turns: usize,
+    #[cfg(target_os = "linux")]
     idle_grace: Duration,
 }
 
@@ -40,6 +44,7 @@ pub trait Recipient: Send + Sync {
 impl HarnessBuilder {
     /// Enables sandboxed agents. Requires [`erissandbox::bootstrap`] at the start of
     /// `main`. Without it the harness runs only direct agents and needs no setup at all.
+    #[cfg(target_os = "linux")]
     pub fn sandboxes(mut self, host: &Host) -> Self {
         self.host = Some(host.clone());
         self
@@ -53,6 +58,7 @@ impl HarnessBuilder {
     }
 
     /// Where sandboxes keep their filesystems. Defaults to `<dir>/sandboxes`.
+    #[cfg(target_os = "linux")]
     pub fn sandbox_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.sandbox_dir = Some(dir.into());
         self
@@ -87,6 +93,7 @@ impl HarnessBuilder {
     }
 
     /// How long an agent's sandbox stays live after its last command. Defaults to 10 seconds.
+    #[cfg(target_os = "linux")]
     pub fn idle_grace(mut self, grace: Duration) -> Self {
         self.idle_grace = grace;
         self
@@ -96,6 +103,7 @@ impl HarnessBuilder {
     pub async fn open(self) -> Result<Arc<Harness>> {
         let transcripts = self.transcripts.unwrap_or_else(|| self.dir.join("transcripts"));
         let store = Store::open(&self.dir.join("harness.db"), &transcripts)?;
+        #[cfg(target_os = "linux")]
         let sandboxes = match &self.host {
             Some(host) => Some(
                 Sandboxes::new(host, self.sandbox_dir.unwrap_or_else(|| self.dir.join("sandboxes")))?
@@ -105,9 +113,11 @@ impl HarnessBuilder {
         };
         let (observations, _) = broadcast::channel(4096);
         let harness = Arc::new_cyclic(|this| Harness {
+            #[cfg(target_os = "linux")]
             host: self.host.clone(),
             mailbox: Arc::new(Inboxes(this.clone())),
             store,
+            #[cfg(target_os = "linux")]
             sandboxes,
             providers: self.providers,
             tools: self.tools,
@@ -137,7 +147,9 @@ struct Run {
 /// Runs agents: stores them, delivers their mail, and runs their turns.
 pub struct Harness {
     store: Store,
+    #[cfg(target_os = "linux")]
     host: Option<Host>,
+    #[cfg(target_os = "linux")]
     sandboxes: Option<Sandboxes>,
     providers: HashMap<String, Arc<dyn Provider>>,
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -218,14 +230,17 @@ impl Harness {
     /// A harness keeping its state in `dir`: `harness.db`, transcripts and sandboxes.
     pub fn builder(dir: impl AsRef<Path>) -> HarnessBuilder {
         HarnessBuilder {
+            #[cfg(target_os = "linux")]
             host: None,
             dir: dir.as_ref().to_owned(),
             transcripts: None,
+            #[cfg(target_os = "linux")]
             sandbox_dir: None,
             providers: HashMap::new(),
             tools: HashMap::new(),
             recipients: HashMap::new(),
             max_turns: 1024,
+            #[cfg(target_os = "linux")]
             idle_grace: Duration::from_secs(10),
         }
     }
@@ -245,6 +260,7 @@ impl Harness {
         if let Some(missing) = spec.tools.iter().find(|t| !self.tools.contains_key(*t)) {
             bail!("unknown tool {missing}");
         }
+        #[cfg(target_os = "linux")]
         if matches!(spec.machine, MachineSpec::Sandbox(_)) && self.sandboxes.is_none() {
             bail!("sandboxes are not enabled; open the harness with HarnessBuilder::sandboxes");
         }
@@ -275,6 +291,7 @@ impl Harness {
             let _ = task.await;
         }
         self.running.lock().unwrap().remove(id);
+        #[cfg(target_os = "linux")]
         if let Some(sandboxes) = &self.sandboxes {
             sandboxes.destroy(id).await?;
         }
@@ -309,7 +326,10 @@ impl Harness {
 
     /// Sandboxes currently running processes.
     pub fn live_sandboxes(&self) -> usize {
-        self.sandboxes.as_ref().map_or(0, Sandboxes::live_count)
+        #[cfg(target_os = "linux")]
+        return self.sandboxes.as_ref().map_or(0, Sandboxes::live_count);
+        #[cfg(not(target_os = "linux"))]
+        0
     }
 
     /// Queues a message for `agent` from `"user"` or another agent's id. An idle agent starts
@@ -398,6 +418,7 @@ impl Harness {
         for task in tasks {
             let _ = task.await;
         }
+        #[cfg(target_os = "linux")]
         if let Some(sandboxes) = &self.sandboxes {
             sandboxes.shutdown_all().await;
         }
@@ -503,10 +524,17 @@ impl Harness {
         let mut transcript = self.store.transcript(agent)?;
         self.close_dangling_calls(agent, &mut transcript)?;
         let machine: Arc<dyn Machine> = match &spec.machine {
+            #[cfg(target_os = "linux")]
             MachineSpec::Sandbox(sandbox) => {
                 self.sandboxes.as_ref().context("sandboxes are not enabled")?.sandbox(agent, sandbox.clone())?
             }
-            MachineSpec::Direct(direct) => Arc::new(Direct::new(direct.clone(), self.host.clone())),
+            #[cfg(target_os = "linux")]
+            MachineSpec::Direct(direct) => Arc::new(match &self.host {
+                Some(host) => Direct::outside(direct.clone(), host.clone()),
+                None => Direct::new(direct.clone()),
+            }),
+            #[cfg(not(target_os = "linux"))]
+            MachineSpec::Direct(direct) => Arc::new(Direct::new(direct.clone())),
         };
         let context =
             ToolContext { agent: agent.to_owned(), machine, mailbox: self.mailbox.clone(), cancel: cancel.clone() };

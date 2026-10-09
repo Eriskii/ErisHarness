@@ -5,7 +5,7 @@ mod common;
 
 use common::model::{Model, calls, says};
 use common::{direct, harness, results, settle};
-use erisharness::agent::{AgentSpec, AgentState};
+use erisharness::agent::AgentState;
 use erisharness::machine::MachineSpec;
 use serde_json::json;
 use std::time::Duration;
@@ -13,7 +13,8 @@ use std::time::Duration;
 #[test]
 fn agents_work_on_the_host_filesystem_in_their_directory() {
     let temp = tempfile::tempdir().unwrap();
-    let project = temp.path().join("project");
+    // `pwd` prints the resolved path, and macOS's temporary directory is behind a symlink.
+    let project = temp.path().canonicalize().unwrap().join("project");
     std::fs::create_dir(&project).unwrap();
     let outside = temp.path().join("outside.txt");
     std::fs::write(&outside, "host file\n").unwrap();
@@ -38,6 +39,7 @@ fn agents_work_on_the_host_filesystem_in_their_directory() {
 }
 
 #[test]
+#[allow(irrefutable_let_patterns)]
 fn direct_agents_inherit_the_harness_environment_unless_given_one() {
     let temp = tempfile::tempdir().unwrap();
     let model = Model::start(vec![calls("c1", "bash", json!({"command": "echo \"$HOME|$ERIS_MARKER\""})), says("ok")]);
@@ -71,21 +73,36 @@ fn interrupting_kills_the_commands_process_group() {
     settle(&h, &agent, AgentState::Idle);
     assert_eq!(results(&h, &agent), [(true, "Command aborted".into())]);
     std::thread::sleep(Duration::from_millis(200));
-    let survivors = std::fs::read_dir("/proc")
+    assert_eq!(command_lines().iter().filter(|line| line.contains(&marker)).count(), 0);
+}
+
+/// Every running process's command line.
+#[cfg(target_os = "linux")]
+fn command_lines() -> Vec<String> {
+    std::fs::read_dir("/proc")
         .unwrap()
         .flatten()
         .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
-        .filter(|cmdline| String::from_utf8_lossy(cmdline).contains(&marker))
-        .count();
-    assert_eq!(survivors, 0);
+        .map(|cmdline| String::from_utf8_lossy(&cmdline).into_owned())
+        .collect()
+}
+
+/// Every running process's command line.
+#[cfg(not(target_os = "linux"))]
+fn command_lines() -> Vec<String> {
+    let ps = std::process::Command::new("ps").args(["-A", "-o", "command="]).output().unwrap();
+    String::from_utf8_lossy(&ps.stdout).lines().map(str::to_owned).collect()
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn sandboxed_agents_need_sandboxes_enabled() {
     let temp = tempfile::tempdir().unwrap();
     let h = harness(&temp.path().join("state"), &Model::start(vec![]));
-    let spec =
-        AgentSpec { machine: MachineSpec::Sandbox(common::sandbox_spec("/nonexistent".into())), ..direct(temp.path()) };
+    let spec = erisharness::agent::AgentSpec {
+        machine: MachineSpec::Sandbox(common::sandbox_spec("/nonexistent".into())),
+        ..direct(temp.path())
+    };
     let error = h.create_agent(spec).unwrap_err().to_string();
     assert!(error.contains("sandboxes are not enabled"), "{error}");
 }

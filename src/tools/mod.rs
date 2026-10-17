@@ -3,12 +3,16 @@
 //! `send_message` for mail.
 
 mod bash;
+#[cfg(feature = "cli")]
+pub mod cli;
 mod edit;
 mod errors;
 mod message;
 mod path;
 mod read;
 mod text;
+#[cfg(feature = "web")]
+pub mod web;
 mod write;
 
 pub use path::resolve;

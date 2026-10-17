@@ -3,7 +3,7 @@
 
 use super::{AnthropicAuth, AnthropicConfig, CacheRetention, Thinking, fingerprint};
 use crate::agent::Item;
-use crate::provider::{Request, user_images, user_text};
+use crate::provider::{Hosted, Request, user_images, user_text};
 use crate::tools::Content;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
@@ -112,6 +112,13 @@ pub fn body(config: &AnthropicConfig, request: &Request, version: &str) -> Resul
         .collect();
     if let (Some(last), Some(cache)) = (tools.last_mut(), &cache) {
         last["cache_control"] = cache.clone();
+    }
+    for hosted in request.hosted {
+        match hosted {
+            Hosted::WebSearch { max_uses } => {
+                tools.push(json!({"type":"web_search_20250305","name":"web_search","max_uses":max_uses}))
+            }
+        }
     }
 
     if let Some(cache) = &cache {

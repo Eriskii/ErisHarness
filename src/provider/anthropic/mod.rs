@@ -191,7 +191,7 @@ impl Anthropic {
             pairs.extend(fingerprint::headers(
                 version,
                 request.cache_key,
-                thinking || !request.tools.is_empty(),
+                thinking || !request.tools.is_empty() || !request.hosted.is_empty(),
                 thinking,
             ));
         } else {

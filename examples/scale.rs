@@ -39,7 +39,7 @@ impl Provider for Stub {
                     arguments: r#"{"command":"echo hi; sleep 2"}"#.into(),
                 }
             };
-            Ok(Completion { items: vec![item], usage: Usage::default() })
+            Ok(Completion { items: vec![item], usage: Usage::default(), sources: Vec::new() })
         })
     }
 }

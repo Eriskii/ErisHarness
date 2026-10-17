@@ -566,6 +566,7 @@ impl Harness {
                 cache_key: agent,
                 system: &system,
                 tools: &tool_specs,
+                hosted: &[],
                 items: &items,
             };
             let Some(completion) = self.call_model(agent, &**provider, request, !compacting, cancel).await? else {

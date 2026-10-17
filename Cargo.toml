@@ -3,7 +3,16 @@ name = "erisharness"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Helpers for tools that are command lines: shell-like word splitting, clap parsing, --grep.
+cli = ["dep:clap", "dep:regex"]
+# The `web` tool: web search, page reading on a model of its own, and polite GETs.
+web = ["cli", "dep:url"]
+
 [dependencies]
+clap = { version = "4.6.7", features = ["derive"], optional = true }
+regex = { version = "1.13.1", optional = true }
+url = { version = "2.5.8", optional = true }
 erissandbox = { git = "https://github.com/Eriskii/ErisSandbox" }
 anyhow = "1.0.104"
 base64 = "0.23.1"
@@ -29,6 +38,10 @@ tokio = { version = "1.53.1", features = ["test-util"] }
 axum = "0.8.9"
 libtest-mimic = "0.8.2"
 tempfile = "3.27.0"
+
+[[test]]
+name = "web"
+required-features = ["web"]
 
 [[test]]
 name = "tools"

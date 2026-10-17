@@ -7,7 +7,8 @@ use axum::response::{IntoResponse, Response};
 use axum::{Router, http::StatusCode, routing::post};
 use erisharness::agent::{AgentSpec, AgentState, Item, Usage};
 use erisharness::provider::{
-    ChatCompletions, ChatCompletionsConfig, Progress, Provider, ProviderEvent, RateGate, Request, StaticToken, ToolSpec,
+    ChatCompletions, ChatCompletionsConfig, Hosted, Progress, Provider, ProviderEvent, RateGate, Request, StaticToken,
+    ToolSpec,
 };
 use erisharness::tools::{Content, ToolOutput};
 use erisharness::{Harness, tools};
@@ -85,7 +86,15 @@ fn says(text: &str) -> (u16, String) {
 }
 
 fn request<'a>(items: &'a [Item], tools: &'a [ToolSpec]) -> Request<'a> {
-    Request { model: "kimi-k3", reasoning_effort: Some("high"), cache_key: "agent", system: "Review.", tools, items }
+    Request {
+        model: "kimi-k3",
+        reasoning_effort: Some("high"),
+        cache_key: "agent",
+        system: "Review.",
+        tools,
+        hosted: &[],
+        items,
+    }
 }
 
 fn input(text: &str) -> Item {
@@ -196,6 +205,17 @@ async fn rate_limits_are_retried_and_reported() {
         .unwrap();
     assert_eq!(completion.items, [Item::Assistant { text: "ok".into() }]);
     assert!(matches!(&events.lock().unwrap()[..], [ProviderEvent::Retry { status: Some(429), .. }]));
+}
+
+#[tokio::test]
+async fn hosted_tools_are_refused_before_any_request() {
+    let server = Server::start(vec![says("ok")]).await;
+    let items = [input("hi")];
+    let hosted = [Hosted::WebSearch { max_uses: 1 }];
+    let error =
+        server.provider(None).complete(Request { hosted: &hosted, ..request(&items, &[]) }, &|_| {}).await.unwrap_err();
+    assert!(error.to_string().contains("no hosted tools"), "{error}");
+    assert!(server.requests().is_empty(), "nothing was sent");
 }
 
 #[tokio::test]

@@ -113,8 +113,8 @@ other's transcripts, bind the `transcripts` directory into their sandboxes.
 
 ## Providers
 
-A `Provider` turns a request (model, system prompt, tools, visible items) into the model's
-next items. The runtime knows no wire format. Three providers are built in, and they share:
+A `Provider` turns a request (model, system prompt, tools, hosted tools, visible items) into
+the model's next items. The runtime knows no wire format. Three providers are built in, and they share:
 
 - `Credentials`, asked for a token before every request, so the host owns login and refresh.
 - A `RateGate` per account, shared by every provider using it. Calls wait for one of its
@@ -147,6 +147,13 @@ each request as Claude Code does. `Thinking` is set per provider: `Disabled`,
 as opaque state in reasoning items and sent back only to the same model. A transport failure
 is retried only before any content streams, so streamed output is never repeated.
 
+**Hosted tools** run on the provider's own servers within one call: `Hosted::WebSearch` is
+OpenAI's `web_search` on Responses and Anthropic's `web_search_20250305` on Anthropic. Their
+results reach the model inside the call and are not kept in the transcript; the pages they
+found come back in `Completion::sources`, with titles where the provider gives them. Chat
+Completions has none and fails such a call. Agents' turns ask for no hosted tools; side calls,
+such as `web`'s, do.
+
 ```rust,no_run
 use erisharness::provider::{Anthropic, AnthropicAuth, AnthropicConfig, ClaudeCode, StaticToken, Thinking};
 use std::sync::Arc;
@@ -177,6 +184,47 @@ registered. A tool call's arguments must be a JSON object (`{}` when there are n
 Anything else, such as JSON cut off mid-stream, stays verbatim in the transcript and gets an
 error result showing the raw input, so the model can send the call again.
 
+**Command-line tools** (feature `cli`): `tools::cli` is for tools the model calls with one
+`command` string, as it would a program. `words` splits the line as a shell would (quotes,
+backslashes, no expansion), `parse` runs it through a clap parser (help is an answer, a parse
+error is the tool's error), `grep` cuts long text down to matching lines with context, and
+`until_stopped` ends a command when its agent is interrupted. No shell runs.
+
+**`web`** (feature `web`) is one such tool, for agents that need the web without filling their
+context with it:
+
+```text
+web search <query…>                                         up to 8 results: title, URL, one line
+web read <url> <question…>                                  a few lines answering the question
+web get <url> [--offset N] [--grep PATTERN [--context N]]   JSON one value per line, 4,000 characters a window
+```
+
+`web search` runs a side call on the searcher model with `Hosted::WebSearch`, so the
+provider's own search finds the pages and the model lists the best, titled from the search's
+sources. With no searcher, or when its call fails (an endpoint without hosted search), search
+falls back to DuckDuckGo's results page and says why. `web read` gives a reader model up to
+120,000 characters of the page as text, links kept as `[text](url)`, and returns only its few
+lines. Every request goes through `web::Http`: GET only, the app's User-Agent, timeouts, an 8 MB
+cap, three requests at a time per host, and no private, loopback or link-local addresses, even
+through DNS or redirects.
+
+```rust,no_run
+use erisharness::tools::web::{Http, Limits, Model, Models, Web};
+# use std::sync::Arc;
+# fn chatgpt() -> Arc<dyn erisharness::provider::Provider> { unimplemented!() }
+
+fn web() -> anyhow::Result<Web> {
+    // A ChatGPT login's small model on the Codex endpoint searches with OpenAI's hosted search.
+    let small = Model { provider: chatgpt(), model: "gpt-6-luna".into(), effort: Some("low".into()) };
+    let models = Models { searcher: Some(small.clone()), reader: Some(small), ..Models::default() };
+    Ok(Web::new(Http::new(Limits::default(), "MyApp/1.0 (+https://example.org)")?, models)
+        .on_usage(|agent, command, usage| println!("{agent} {command}: {} in, {} out", usage.input, usage.output)))
+}
+```
+
+`on_usage` reports each side call's tokens with the agent and the command (`web search` or
+`web read`), and `on_command` each command line as it starts.
+
 ## Cost
 
 `cargo run --release --example scale -- <rootfs> 50000 3000 2000` on a 32 GB desktop:
@@ -199,8 +247,8 @@ what [ErisSandbox needs](https://github.com/Eriskii/ErisSandbox#requirements); e
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --all-targets --features web -- -D warnings
+cargo test --features web
 ```
 
 The sandbox tests (`agent`, `tools`) and the `scale` example run on Linux only, and export
@@ -208,7 +256,7 @@ The sandbox tests (`agent`, `tools`) and the `scale` example run on Linux only, 
 run on macOS too:
 
 ```sh
-cargo test --lib --test anthropic --test chat --test direct --test lifecycle --test mail
+cargo test --features web --lib --test anthropic --test chat --test direct --test lifecycle --test mail --test web
 cargo test --doc
 ```
 

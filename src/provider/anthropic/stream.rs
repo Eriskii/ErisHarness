@@ -3,7 +3,7 @@
 //! the harness, which answers it with a tool error.
 
 use crate::agent::{Item, Usage};
-use crate::provider::{Completion, Progress};
+use crate::provider::{Completion, Progress, Source};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -103,9 +103,19 @@ impl<'a> Stream<'a> {
                     bail!("Anthropic stopped with {}", self.stop.as_deref().unwrap());
                 }
                 let mut items = Vec::new();
+                let mut sources = Vec::new();
                 for block in self.blocks.values() {
                     let v = &block.value;
                     match v["type"].as_str() {
+                        // A hosted search's call and results: the model read them within this
+                        // call; the pages they name are its sources.
+                        Some("server_tool_use") => {}
+                        Some("web_search_tool_result") => {
+                            for result in v["content"].as_array().into_iter().flatten() {
+                                let text = |key: &str| result[key].as_str().unwrap_or_default().to_owned();
+                                Source::add(&mut sources, &text("url"), &text("title"));
+                            }
+                        }
                         Some("text") => {
                             let text = v["text"].as_str().context("text block is missing text")?;
                             if !text.is_empty() {
@@ -142,6 +152,7 @@ impl<'a> Stream<'a> {
                 let n = |key| self.usage[key].as_u64().unwrap_or_default();
                 return Ok(Some(Completion {
                     items,
+                    sources,
                     usage: Usage {
                         input: n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens"),
                         cached_input: n("cache_read_input_tokens"),

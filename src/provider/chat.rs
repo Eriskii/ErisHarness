@@ -99,6 +99,10 @@ impl Provider for ChatCompletions {
         progress: &'a (dyn Fn(Progress) + Send + Sync),
     ) -> BoxFuture<'a, Result<Completion>> {
         Box::pin(async move {
+            anyhow::ensure!(
+                request.hosted.is_empty(),
+                "Chat Completions has no hosted tools such as web search; use a Responses or Anthropic provider"
+            );
             let body = self.body(&request);
             transport::retrying(&self.config.gate, self.config.max_retries, progress, || self.attempt(&body, progress))
                 .await
@@ -169,6 +173,7 @@ impl Reply {
         let details = &usage["prompt_tokens_details"];
         Ok(Completion {
             items,
+            sources: Vec::new(),
             usage: Usage {
                 input: n(&usage["prompt_tokens"]),
                 cached_input: details["cached_tokens"].as_u64().unwrap_or_else(|| n(&usage["prompt_cache_hit_tokens"])),

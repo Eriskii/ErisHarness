@@ -14,8 +14,8 @@ use erisharness::{
     Harness,
     agent::{AgentRecord, AgentSpec, AgentState, Item, Observation, Usage},
     provider::{
-        Anthropic, AnthropicAuth, AnthropicConfig, ClaudeCode, Progress, Provider, ProviderEvent, Request, StaticToken,
-        Thinking, ToolSpec,
+        Anthropic, AnthropicAuth, AnthropicConfig, ClaudeCode, Hosted, Progress, Provider, ProviderEvent, Request,
+        Source, StaticToken, Thinking, ToolSpec,
     },
     tools,
 };
@@ -150,6 +150,7 @@ fn request<'a>(items: &'a [Item], tools: &'a [ToolSpec]) -> Request<'a> {
         cache_key: "session-id",
         system: "Review code.",
         tools,
+        hosted: &[],
         items,
     }
 }
@@ -458,4 +459,44 @@ async fn images_sent_with_mail_follow_its_text() {
     assert_eq!(content[0]["text"], "What is here?");
     assert_eq!(content[1]["type"], "image");
     assert_eq!(content[1]["source"], json!({"type":"base64","media_type":"image/jpeg","data":"/9j/"}));
+}
+
+#[tokio::test]
+async fn hosted_web_search_is_asked_for_and_its_pages_come_back_as_sources() {
+    let server = Server::new(vec![events(
+        vec![
+            json!({"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"dane county parcels"}}),
+            json!({"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[
+                {"type":"web_search_result","url":"https://a.gov/parcels","title":"A Parcels","encrypted_content":"x"},
+                {"type":"web_search_result","url":"https://b.org/gis","title":"B GIS","encrypted_content":"y"},
+            ]}),
+            json!({"type":"text","text":"https://a.gov/parcels — the county's parcel viewer"}),
+        ],
+        "end_turn",
+    )])
+    .await;
+    let provider = Anthropic::new(server.config(true)).unwrap();
+    let items = [Item::Input {
+        from: "user".into(),
+        text: "Search the web for: dane county parcels".into(),
+        images: Vec::new(),
+    }];
+    let completion = provider
+        .complete(Request { hosted: &[Hosted::WebSearch { max_uses: 1 }], ..request(&items, &[]) }, &|_| {})
+        .await
+        .unwrap();
+    assert_eq!(
+        completion.items,
+        [Item::Assistant { text: "https://a.gov/parcels — the county's parcel viewer".into() }]
+    );
+    assert_eq!(
+        completion.sources,
+        [
+            Source { url: "https://a.gov/parcels".into(), title: "A Parcels".into() },
+            Source { url: "https://b.org/gis".into(), title: "B GIS".into() },
+        ]
+    );
+    let script = server.script.lock().unwrap();
+    let body: Value = serde_json::from_str(&script.requests[0].1).unwrap();
+    assert_eq!(body["tools"], json!([{"type":"web_search_20250305","name":"web_search","max_uses":1}]));
 }

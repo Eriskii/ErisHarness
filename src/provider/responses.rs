@@ -2,7 +2,7 @@
 //! the whole visible transcript is sent each time, carrying encrypted reasoning back with it.
 
 use super::transport::{self, Events, Failure};
-use super::{Completion, Credentials, Progress, Provider, RateGate, Request, user_images, user_text};
+use super::{Completion, Credentials, Hosted, Progress, Provider, RateGate, Request, Source, user_images, user_text};
 use crate::agent::{Item, Usage};
 use crate::tools::{Content, ToolOutput};
 use anyhow::{Result, anyhow};
@@ -35,14 +35,26 @@ impl Responses {
     }
 
     fn body(&self, request: &Request) -> Value {
+        let mut tools: Vec<Value> = request
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function", "name": t.name, "description": t.description,
+                    "parameters": t.parameters, "strict": false,
+                })
+            })
+            .collect();
+        for hosted in request.hosted {
+            match hosted {
+                Hosted::WebSearch { .. } => tools.push(json!({"type": "web_search"})),
+            }
+        }
         let mut body = json!({
             "model": request.model,
             "instructions": request.system,
             "input": request.items.iter().filter_map(input_item).collect::<Vec<_>>(),
-            "tools": request.tools.iter().map(|t| json!({
-                "type": "function", "name": t.name, "description": t.description,
-                "parameters": t.parameters, "strict": false,
-            })).collect::<Vec<_>>(),
+            "tools": tools,
             "tool_choice": "auto",
             "parallel_tool_calls": true,
             "stream": true,
@@ -67,13 +79,17 @@ impl Responses {
         }
         let mut events = Events::new(transport::send(request, progress).await?);
         let mut items = Vec::new();
+        let mut sources = Vec::new();
         while let Some(data) = events.next().await {
             let Ok(event) = serde_json::from_str::<Value>(&data.map_err(Failure::retry)?) else { continue };
             match event["type"].as_str().unwrap_or_default() {
                 "response.output_text.delta" => progress(Progress::Text(event["delta"].as_str().unwrap_or_default())),
-                "response.output_item.done" => items.extend(output_item(&event["item"])),
+                "response.output_item.done" => {
+                    sources_of(&event["item"], &mut sources);
+                    items.extend(output_item(&event["item"]));
+                }
                 "response.completed" | "response.incomplete" => {
-                    return Ok(Completion { items, usage: usage(&event["response"]["usage"]) });
+                    return Ok(Completion { items, usage: usage(&event["response"]["usage"]), sources });
                 }
                 "response.failed" | "error" => {
                     let message = event["response"]["error"]["message"].as_str().or(event["message"].as_str());
@@ -108,6 +124,28 @@ fn usage(value: &Value) -> Usage {
         cache_write: 0,
         output: n(&value["output_tokens"]),
         reasoning: n(&value["output_tokens_details"]["reasoning_tokens"]),
+    }
+}
+
+/// The pages an output item names: a web search call's sources, and the URLs a message cites.
+fn sources_of(item: &Value, sources: &mut Vec<Source>) {
+    let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
+    match item["type"].as_str() {
+        Some("web_search_call") => {
+            for source in item["action"]["sources"].as_array().into_iter().flatten() {
+                Source::add(sources, &text(&source["url"]), &text(&source["title"]));
+            }
+        }
+        Some("message") => {
+            for part in item["content"].as_array().into_iter().flatten() {
+                for note in part["annotations"].as_array().into_iter().flatten() {
+                    if note["type"] == "url_citation" {
+                        Source::add(sources, &text(&note["url"]), &text(&note["title"]));
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 

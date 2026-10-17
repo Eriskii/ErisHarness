@@ -38,7 +38,18 @@ pub struct Request<'a> {
     pub cache_key: &'a str,
     pub system: &'a str,
     pub tools: &'a [ToolSpec],
+    /// Tools the provider runs on its own servers within the call, such as web search. Their
+    /// results reach the model inside the same call and are not kept in the transcript.
+    pub hosted: &'a [Hosted],
     pub items: &'a [Item],
+}
+
+/// A tool the provider runs itself. A provider that has no such tool fails the call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hosted {
+    /// The provider's web search: OpenAI's `web_search`, Anthropic's `web_search_20250305`,
+    /// searching at most `max_uses` times in the call where the provider counts them.
+    WebSearch { max_uses: u32 },
 }
 
 pub struct ToolSpec {
@@ -51,6 +62,24 @@ pub struct ToolSpec {
 pub struct Completion {
     pub items: Vec<Item>,
     pub usage: Usage,
+    /// Pages the provider's hosted tools consulted or the answer cites, in the order given.
+    pub sources: Vec<Source>,
+}
+
+/// A page a hosted tool found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Source {
+    pub url: String,
+    pub title: String,
+}
+
+impl Source {
+    /// Adds a source unless its URL is in `sources` already.
+    pub(crate) fn add(sources: &mut Vec<Source>, url: &str, title: &str) {
+        if !url.is_empty() && !sources.iter().any(|s| s.url == url) {
+            sources.push(Source { url: url.into(), title: title.into() });
+        }
+    }
 }
 
 /// What a model call reports while it runs.
